@@ -60,18 +60,6 @@ func exceptionAuditSource(exception armotypes.PostureExceptionPolicy) (int, bool
 	return i, ok && i >= 0
 }
 
-// exceptionAuditIdentity identifies the loaded exception a match came from: its
-// GUID, else its source index, else (untagged) its name.
-func exceptionAuditIdentity(exception armotypes.PostureExceptionPolicy) string {
-	if exception.GUID != "" {
-		return exception.GUID
-	}
-	if i, ok := exceptionAuditSource(exception); ok {
-		return "\x00source/" + strconv.Itoa(i)
-	}
-	return exceptionAuditName(exception)
-}
-
 func buildExceptionAudit(
 	loadedExceptions []armotypes.PostureExceptionPolicy,
 	activeExceptions []armotypes.PostureExceptionPolicy,
@@ -156,8 +144,16 @@ func buildExceptionAudit(
 	// Manual controls never appear in results (they have no resourcesresults.Result
 	// entries at all), so without this an exception that only suppresses a manual
 	// control is reported as unused even though it is actively applied.
+	// A partial framework match is still an audit match, but an exception counts
+	// once per manual control, however many frameworks, identical repeats or
+	// policies sharing its GUID matched it.
+	counted := make(map[[2]string]struct{}, len(manualControlMatches))
 	for _, match := range manualControlMatches {
 		key := resolve(match.exception)
+		if _, ok := counted[[2]string{key, match.controlID}]; ok {
+			continue
+		}
+		counted[[2]string{key, match.controlID}] = struct{}{}
 		items[key].MatchCount++
 		items[key].MatchedResources = append(items[key].MatchedResources, cautils.ExceptionAuditMatch{ControlID: match.controlID})
 	}

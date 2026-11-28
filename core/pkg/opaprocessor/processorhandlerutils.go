@@ -194,18 +194,7 @@ func applyExceptionsToManualControls(
 		}
 	}
 
-	// A partial framework match is still an audit match, but the same exception
-	// applied through multiple frameworks counts only once for each control.
-	seen := make(map[struct{ exception, control string }]bool)
-	unique := matches[:0]
-	for _, match := range matches {
-		key := struct{ exception, control string }{exceptionAuditIdentity(match.exception), match.controlID}
-		if !seen[key] {
-			seen[key] = true
-			unique = append(unique, match)
-		}
-	}
-	return unique
+	return matches
 }
 
 // applyExceptionsToControlSummaries updates manual controls in a single ControlSummaries map.

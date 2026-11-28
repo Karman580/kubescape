@@ -451,6 +451,24 @@ func TestUpdateResults_ExceptionAuditKeepsSameNameManualMatchesApart(t *testing.
 	}
 }
 
+// Identical repeats of one exception share an item and count a manual control
+// once, as a single exception does.
+func TestUpdateResults_ExceptionAuditCountsIdenticalRepeatsManualMatchOnce(t *testing.T) {
+	session := cautils.NewOPASessionObjMock()
+	session.AuditExceptions = true
+	session.Report.SummaryDetails.Controls = reportsummary.ControlSummaries{
+		"C-0286": {ControlID: "C-0286", StatusInfo: apis.StatusInfo{InnerStatus: apis.StatusSkipped, SubStatus: apis.SubStatusManualReview}},
+	}
+	repeated := auditException("shared", "C-0286", nil)
+	session.Exceptions = []armotypes.PostureExceptionPolicy{repeated, repeated}
+
+	opap := &OPAProcessor{OPASessionObj: session}
+	opap.updateResults(context.Background())
+
+	require.Len(t, opap.ExceptionAudit.Items, 1)
+	assert.Equal(t, 1, opap.ExceptionAudit.Items[0].MatchCount)
+}
+
 // Policies sharing a GUID are one exception, so a manual control they both
 // match is counted once.
 func TestUpdateResults_ExceptionAuditCountsSameGUIDManualMatchOnce(t *testing.T) {
