@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,7 +22,63 @@ const (
 	scanResultsMaxBytes     = 32 << 20
 )
 
+type preparedScanResultsKey struct{}
+
+// Supports scan callbacks that still return complete serialized results.
 type fullScanResultsKey struct{}
+
+// The scan goroutine builds this once. Waiting callers share its immutable
+// payload and attach session ownership only when registering a snapshot.
+type preparedScanResults struct {
+	document  scanResultDocument
+	size      int
+	oversized bool
+}
+
+func (p *preparedScanResults) buildSnapshot(response scanResponse, count int, resourceAt func(int) any) error {
+	response.FailedResources = nil
+	doc := scanResultDocument{scanResponse: response, Resources: []json.RawMessage{}}
+	metadata, err := json.Marshal(doc)
+	if err != nil {
+		return fmt.Errorf("encode scan metadata: %w", err)
+	}
+	size := len(metadata)
+	// IDs always contain 64 hex characters. A UTC timestamp without fractional
+	// seconds is the shortest expiry representation registration can produce.
+	// Reserve that minimum here and check the exact expiry at registration.
+	reserved := doc
+	reserved.ScanID = strings.Repeat("0", 64)
+	expiry := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	reserved.ExpiresAt = &expiry
+	reservedMetadata, err := json.Marshal(reserved)
+	if err != nil {
+		return fmt.Errorf("encode snapshot registration metadata: %w", err)
+	}
+	overhead := len(reservedMetadata) - len(metadata)
+	for i := 0; i < count; i++ {
+		data, err := json.Marshal(resourceAt(i))
+		if err != nil {
+			return fmt.Errorf("encode scan resource: %w", err)
+		}
+		cost := len(data)
+		if i > 0 {
+			cost++ // Comma between entries.
+		}
+		if cost > scanResultsMaxBytes-size-overhead {
+			p.oversized = true
+			return nil
+		}
+		doc.Resources = append(doc.Resources, data)
+		size += cost
+	}
+	p.document, p.size = doc, size
+	return nil
+}
+
+type sharedScanResults struct {
+	preparedScanResults
+	firstPage []byte
+}
 
 // Raw messages preserve resource JSON, including numeric values, across pages.
 type scanResultDocument struct {
@@ -79,7 +136,21 @@ func (s *scanResultStore) firstPage(owner string, doc scanResultDocument, size i
 	}
 	id := hex.EncodeToString(token[:])
 	expires := now.Add(scanResultsTTL)
+	before, err := snapshotMetadataSize(doc)
+	if err != nil {
+		return nil, err
+	}
 	doc.ScanID, doc.ExpiresAt = id, &expires
+	after, err := snapshotMetadataSize(doc)
+	if err != nil {
+		return nil, err
+	}
+	size += after - before
+	if size > scanResultsMaxBytes {
+		doc.ScanID, doc.ExpiresAt = "", nil
+		doc.PaginationWarning = "Full results could not be retained (retention limit exceeded); narrow the scan scope."
+		return marshalScanPage(doc, 0, limit)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -102,17 +173,31 @@ func (s *scanResultStore) firstPage(owner string, doc scanResultDocument, size i
 	return marshalScanPage(doc, 0, limit)
 }
 
+// Count metadata without copying or re-encoding the retained resource payload.
+func snapshotMetadataSize(doc scanResultDocument) (int, error) {
+	doc.Resources = []json.RawMessage{}
+	data, err := json.Marshal(doc)
+	if err != nil {
+		return 0, fmt.Errorf("encode snapshot metadata: %w", err)
+	}
+	return len(data), nil
+}
+
 func (s *scanResultStore) page(owner, id string, offset, limit int, now time.Time) ([]byte, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.expireLocked(now)
 	entry, ok := s.entries[id]
 	if !ok || owner == "" || owner != entry.owner {
+		s.mu.Unlock()
 		return nil, errScanResultsUnavailable
 	}
 	if offset < 0 || offset > len(entry.document.Resources) || limit < 1 || limit > maxFailedResources {
+		s.mu.Unlock()
 		return nil, fmt.Errorf("offset must be between 0 and total_failed; limit must be between 1 and %d", maxFailedResources)
 	}
+	s.mu.Unlock()
+
+	// The local entry keeps the immutable document alive even if the store evicts it.
 	return marshalScanPage(entry.document, offset, limit)
 }
 
@@ -224,64 +309,50 @@ func decodeOversizedScanDocument(data []byte, limit int) (scanResultDocument, er
 	}, nil
 }
 
-type sharedScanPayload struct {
-	data []byte
-	doc  *scanResultDocument
-	size int
-}
-
 // doResultScan retains ownership only after shared execution has returned to
 // each caller. A shared scan must never inherit its first caller's session.
 func (ksServer *KubescapeMcpserver) doResultScan(ctx context.Context, key string, run func(context.Context) (interface{}, error), limitOpt ...int) (interface{}, error) {
 	v, err := ksServer.doScanChan(ctx, key, func(scanCtx context.Context) (interface{}, error) {
-		res, err := run(context.WithValue(scanCtx, fullScanResultsKey{}, true))
+		var result sharedScanResults
+		value, err := run(context.WithValue(context.WithValue(scanCtx, fullScanResultsKey{}, true), preparedScanResultsKey{}, &result.preparedScanResults))
 		if err != nil {
 			return nil, err
 		}
-		data, ok := res.([]byte)
+		data, ok := value.([]byte)
 		if !ok {
 			return nil, errors.New("unexpected scan result type")
 		}
-
-		size := len(data)
-		// Check retention limit before decoding the full document. If the payload
-		// exceeds the retention bound, avoid decoding all resources and decode only
-		// the first page.
-		if size > scanResultsMaxBytes {
-			doc, err := decodeOversizedScanDocument(data, maxFailedResources)
-			if err != nil {
-				return nil, err
+		result.firstPage = data
+		if result.document.Resources == nil {
+			var doc scanResultDocument
+			if len(data) > scanResultsMaxBytes {
+				decoded, err := decodeOversizedScanDocument(data, maxFailedResources)
+				if err != nil {
+					return nil, err
+				}
+				doc = decoded
+			} else if err := json.Unmarshal(data, &doc); err != nil {
+				return nil, fmt.Errorf("decode scan results: %w", err)
 			}
-			if doc.Resources == nil {
-				return &sharedScanPayload{data: data}, nil
-			}
-			return &sharedScanPayload{doc: &doc, data: data, size: size}, nil
+			result.document, result.size = doc, len(data)
 		}
-
-		// Decode once per shared scan so concurrent callers share the parsed immutable document.
-		var doc scanResultDocument
-		if err := json.Unmarshal(data, &doc); err != nil {
-			return nil, fmt.Errorf("decode scan results: %w", err)
-		}
-		if doc.Resources == nil {
-			return &sharedScanPayload{data: data}, nil
-		}
-		if doc.TotalFailed != len(doc.Resources) {
-			return nil, errors.New("scan returned incomplete results before pagination")
-		}
-		return &sharedScanPayload{doc: &doc, data: data, size: size}, nil
+		return result, nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	payload, ok := v.(*sharedScanPayload)
+	result, ok := v.(sharedScanResults)
 	if !ok {
-		return nil, errors.New("unexpected scan result type")
+		return nil, errors.New("unexpected shared scan result type")
 	}
-	if payload.doc == nil {
-		return payload.data, nil
+	if result.document.Resources == nil {
+		return result.firstPage, nil
 	}
-	return ksServer.scanResults.firstPage(scanResultOwner(ctx), *payload.doc, payload.size, time.Now(), limitOpt...)
+	if result.oversized {
+		// The serialized first page may fit even when the full snapshot did not.
+		result.size = scanResultsMaxBytes + 1
+	}
+	return ksServer.scanResults.firstPage(scanResultOwner(ctx), result.document, result.size, time.Now(), limitOpt...)
 }
 
 func createScanResultsTool(ksServer *KubescapeMcpserver) {

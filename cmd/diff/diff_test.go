@@ -3,6 +3,7 @@ package diff
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/kubescape/kubescape/v4/core/core"
 	metav1 "github.com/kubescape/kubescape/v4/core/meta/datastructures/v1"
 	"github.com/kubescape/kubescape/v4/core/mocks"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -46,7 +48,9 @@ func TestGetDiffCmd_FormatValidation(t *testing.T) {
 		{name: "sarif", format: "sarif", wantFormat: "sarif"},
 		{name: "junit", format: "junit", wantFormat: "junit"},
 		{name: "gitlab-sast", format: "gitlab-sast", wantFormat: "gitlab-sast"},
+		{name: "gitlab-codequality", format: "gitlab-codequality", wantFormat: "gitlab-codequality"},
 		{name: "markdown", format: "markdown", wantFormat: "markdown"},
+		{name: "github-actions", format: "github-actions", wantFormat: "github-actions"},
 		{name: "uppercase format is normalized", format: "JSON", wantFormat: "json"},
 		{name: "padded format is normalized", format: "  yaml  ", wantFormat: "yaml"},
 		{name: "empty format is rejected", format: "", wantError: true, expectedErr: "format cannot be empty, supported formats:"},
@@ -564,4 +568,70 @@ func TestGetDiffCmd_RejectsEncryptedReports(t *testing.T) {
 		assert.Contains(t, err.Error(), "cannot diff encrypted report")
 		assert.Contains(t, err.Error(), "decrypt first with 'kubescape decrypt'")
 	})
+}
+
+func TestGetDiffCmd_FlagCompletions(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		expected []string
+		excluded []string
+	}{
+		{
+			name:     "format lists diff formats and excludes scan-only html",
+			args:     []string{"__complete", "diff", "--format", ""},
+			expected: []string{"pretty-printer", "summary-json", "summary-yaml", "summary-csv", "json", "yaml", "sarif", "junit", "gitlab-sast", "markdown", "github-actions", "gitlab-codequality"},
+			excluded: []string{"html", "pdf"},
+		},
+		{
+			name:     "format prefix s matches summary and sarif",
+			args:     []string{"__complete", "diff", "--format", "s"},
+			expected: []string{"summary-json", "summary-yaml", "summary-csv", "sarif"},
+			excluded: []string{"json", "markdown"},
+		},
+		{
+			name:     "severity-threshold lists severities",
+			args:     []string{"__complete", "diff", "--severity-threshold", ""},
+			expected: []string{"low", "medium", "high", "critical"},
+		},
+		{
+			name:     "severity-threshold preserves uppercase prefix",
+			args:     []string{"__complete", "diff", "--severity-threshold", "H"},
+			expected: []string{"High"},
+			excluded: []string{"low", "medium", "critical"},
+		},
+		{
+			name:     "granularity lists evidence and control",
+			args:     []string{"__complete", "diff", "--granularity", ""},
+			expected: []string{"evidence", "control"},
+		},
+		{
+			name:     "granularity prefix c matches control",
+			args:     []string{"__complete", "diff", "--granularity", "c"},
+			expected: []string{"control"},
+			excluded: []string{"evidence"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := &cobra.Command{Use: "kubescape"}
+			root.AddCommand(GetDiffCmd(nil))
+
+			var output bytes.Buffer
+			root.SetOut(&output)
+			root.SetErr(io.Discard)
+			root.SetArgs(tt.args)
+
+			require.NoError(t, root.Execute())
+			lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+
+			for _, want := range tt.expected {
+				assert.Contains(t, lines, want)
+			}
+			for _, unwanted := range tt.excluded {
+				assert.NotContains(t, lines, unwanted)
+			}
+		})
+	}
 }

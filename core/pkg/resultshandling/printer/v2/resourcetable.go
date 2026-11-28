@@ -109,14 +109,14 @@ func (prettyPrinter *PrettyPrinter) resourceTable(opaSessionObj *cautils.OPASess
 
 		if source, ok := opaSessionObj.ResourceSource[resourceID]; ok {
 			if srcPath := BestSourcePath(source); srcPath != "" {
-				fmt.Fprintf(prettyPrinter.writer, "Source: %s\n", srcPath)
+				fmt.Fprintf(prettyPrinter.writer, "Source: %s\n", sanitizeText(srcPath))
 			}
 		}
-		fmt.Fprintf(prettyPrinter.writer, "ApiVersion: %s\n", resource.GetApiVersion())
-		fmt.Fprintf(prettyPrinter.writer, "Kind: %s\n", resource.GetKind())
-		fmt.Fprintf(prettyPrinter.writer, "Name: %s\n", resource.GetName())
+		fmt.Fprintf(prettyPrinter.writer, "ApiVersion: %s\n", sanitizeText(resource.GetApiVersion()))
+		fmt.Fprintf(prettyPrinter.writer, "Kind: %s\n", sanitizeText(resource.GetKind()))
+		fmt.Fprintf(prettyPrinter.writer, "Name: %s\n", sanitizeText(resource.GetName()))
 		if resource.GetNamespace() != "" {
-			fmt.Fprintf(prettyPrinter.writer, "Namespace: %s\n", resource.GetNamespace())
+			fmt.Fprintf(prettyPrinter.writer, "Namespace: %s\n", sanitizeText(resource.GetNamespace()))
 		}
 		fmt.Fprintf(prettyPrinter.writer, "\n%s\n\n", prettyprinter.ControlCountersForResource(cautils.ControlIDsByStatus(summary, &result)))
 
@@ -142,7 +142,7 @@ func (prettyPrinter *PrettyPrinter) resourceTable(opaSessionObj *cautils.OPASess
 				return cautils.TraceKustomizePatch(resource, paths, source)
 			}
 		}
-		resourceRows := generateResourceRows(result.ListControls(), summary, resource, prettyPrinter.showEvidence, prettyPrinter.showSecrets, sourcePath, lineFor, patchFor)
+		resourceRows := generateResourceRowsWithPreserved(result.ListControls(), summary, resource, prettyPrinter.showEvidence, prettyPrinter.showSecrets, sourcePath, lineFor, opaSessionObj.PreservedValuesForResource(resourceID), patchFor)
 
 		short := utils.CheckShortTerminalWidth(resourceRows, generateResourceHeader(false))
 		if short {
@@ -453,6 +453,10 @@ func valuesMatch(a, b any) bool {
 }
 
 func generateResourceRows(controls []resourcesresults.ResourceAssociatedControl, summaryDetails *reportsummary.SummaryDetails, resource workloadinterface.IMetadata, showEvidence bool, showSecrets bool, sourcePath string, lineFor func(string) (int, bool), patchFor ...func([]string) string) []table.Row {
+	return generateResourceRowsWithPreserved(controls, summaryDetails, resource, showEvidence, showSecrets, sourcePath, lineFor, nil, patchFor...)
+}
+
+func generateResourceRowsWithPreserved(controls []resourcesresults.ResourceAssociatedControl, summaryDetails *reportsummary.SummaryDetails, resource workloadinterface.IMetadata, showEvidence bool, showSecrets bool, sourcePath string, lineFor func(string) (int, bool), preserved map[string]string, patchFor ...func([]string) string) []table.Row {
 	var rows []table.Row
 
 	for i := range controls {
@@ -465,7 +469,7 @@ func generateResourceRows(controls []resourcesresults.ResourceAssociatedControl,
 		row[resourceColumnURL] = cautils.GetControlLink(controls[i].GetID())
 		if showEvidence {
 			displayed := cautils.EvidenceControl(summaryDetails, controls[i])
-			paths := evidencePathsWithCurrentValues(&displayed, resource, showSecrets)
+			paths := evidencePathsWithCurrentValues(&displayed, resource, showSecrets, preserved)
 			addContainerNameToAssistedRemediation(resource, &paths)
 			annotatePathLines(&paths, &displayed, lineFor)
 			srcDisplay := sourcePath
@@ -480,6 +484,10 @@ func generateResourceRows(controls []resourcesresults.ResourceAssociatedControl,
 			}
 			if srcDisplay != "" {
 				paths = append([]string{"@ " + srcDisplay}, paths...)
+			}
+			for j := range paths {
+				// file names, current values and container names come from the scanned files
+				paths[j] = sanitizeText(paths[j])
 			}
 			row[resourceColumnPath] = strings.Join(paths, "\n")
 		}

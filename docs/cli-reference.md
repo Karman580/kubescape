@@ -59,7 +59,7 @@ kubescape scan [target] [flags]
 | `--fail-on-degraded-config` | Fail the scan (exit code `1`) if control configurations or exceptions could not be loaded from their configured source and bundled defaults were used instead | `false` |
 | `--scan-contract <path>` | Path to an explicit repository scan contract. Posture scans only: `scan image` rejects it | - |
 | `--contract <name>` | Named contract to select from the `--scan-contract` file. Requires `--scan-contract` | `spec.defaultContract` |
-| `-f, --format <format>` | Output format: `pretty-printer`, `json`, `junit`, `prometheus`, `pdf`, `html`, `sarif`, `gitlab-sast`, `gitlab-codequality`, `gitlab-container-scanning`, `github-actions`, `yaml`, `csv`, `markdown`, `policyreport`, `exceptions`, `cyclonedx-json`, `spdx-json` — see [generating an exceptions baseline](#generating-an-exceptions-baseline) and [generating an SBOM](#generating-an-sbom). `github-actions` emits failed High/Critical controls as `::error` workflow commands for inline PR annotations; local file scans only, capped at GitHub's 10-annotations-per-step limit. `gitlab-codequality` writes a GitLab Code Quality report for merge request widgets; local file scans only | `pretty-printer` |
+| `-f, --format <format>` | Output format: `pretty-printer`, `json`, `junit`, `prometheus`, `pdf`, `html`, `sarif`, `gitlab-sast`, `gitlab-codequality`, `gitlab-container-scanning`, `github-actions`, `yaml`, `csv`, `markdown`, `policyreport`, `exceptions`, `cyclonedx-json`, `spdx-json` — see [generating an exceptions baseline](#generating-an-exceptions-baseline) and [generating an SBOM](#generating-an-sbom). `github-actions` emits failed High/Critical controls as `::error` workflow commands for inline PR annotations; local file scans and `scan image` only, capped at GitHub's 10-annotations-per-step limit. `gitlab-codequality` writes a GitLab Code Quality report for merge request widgets; local file scans only | `pretty-printer` |
 | `--hide` | Replace sensitive report metadata with deterministic pseudonyms. Ignored when `--encrypt` is also specified. | `false` |
 | `--host-scan` | Enable host data collection from cluster nodes for certain controls. When not set, Kubescape auto-detects node-agent CRDs and uses a CRD-based host sensor if available. Use `--host-scan=false` to disable host data collection. See the [Kubescape operator](https://github.com/kubescape/helm-charts/tree/main/charts/kubescape-operator) for a managed alternative. | auto-detect |
 | `--include-namespaces <ns>` | Namespaces to include (comma-separated). Cannot be combined with `--exclude-namespaces` | - |
@@ -515,9 +515,10 @@ the policy, that object supplies `params` even when its kind is not the bundled
 resolution falls back to the bundled `ControlConfiguration` — when there is no
 binding, the binding does not cover the matched resource, or the binding names no
 object — because the scan cannot supply the inputs admission uses. (Policies
-matched by multiple bindings, or bindings that select parameters dynamically via
+matched by multiple bindings that supply parameters, or bindings that select parameters dynamically via
 `spec.paramRef.selector`, are also refused before resolution to preserve
-admission parity.)
+admission parity. Several bindings that supply no parameters change nothing,
+since a binding steers a scan only through its params.)
 
 Every custom rule becomes a control named `custom-<rule>` in the report.
 
@@ -889,7 +890,7 @@ kubescape scan image <image>:<tag> [<image>:<tag>...] [flags]
 | Flag | Description |
 |------|-------------|
 | `--exceptions <path>` | Path to exceptions file. Targets are matched per image, so one file can carry rules for every image in the run |
-| `-f, --format <format>` | Output format: `pretty-printer`, `json`, `junit`, `prometheus`, `pdf`, `html`, `sarif`, `gitlab-sast`, `gitlab-container-scanning`, `yaml`, `csv`, `markdown`, `cyclonedx-json`, `spdx-json`, `policyreport` — see [CSV export](image-scanning.md#csv-export) |
+| `-f, --format <format>` | Output format: `pretty-printer`, `json`, `junit`, `prometheus`, `pdf`, `html`, `sarif`, `gitlab-sast`, `gitlab-container-scanning`, `github-actions`, `yaml`, `csv`, `markdown`, `cyclonedx-json`, `spdx-json`, `policyreport` — see [CSV export](image-scanning.md#csv-export) and [GitHub Actions annotations](image-scanning.md#github-actions-annotations) |
 | `--image-scan-concurrency <n>` | Number of images scanned in parallel (default `1`) |
 | `-p, --password <pass>` | Registry password |
 | `--platform <platform>` | OCI platform to scan, for example `linux/amd64`, `linux/arm64/v8`, or `windows/amd64`. Applies to every image in the run |
@@ -917,6 +918,11 @@ and `spdx-json` emit a JSON array with one document per image (a single image
 keeps the bare document shape), while the table, HTML, PDF, markdown, CSV,
 SARIF, GitLab SAST, JUnit and Prometheus outputs report every image in one
 document.
+
+Compare two image JSON reports with `kubescape diff base.json head.json --format junit`.
+JUnit diff testcase names include the package type when known, for example
+`CVE-1 (requests 2.0) [python]`, to distinguish findings in different package
+ecosystems. When the type is missing, the name remains `CVE-1 (requests 2.0)`.
 
 `policyreport` writes one `ClusterPolicyReport` per image, with one result per
 vulnerability. Each report is labeled `kubescape.io/report-type:

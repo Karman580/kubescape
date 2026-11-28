@@ -19,6 +19,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/edsrzf/mmap-go"
 	"github.com/kubescape/go-logger"
 	"github.com/kubescape/go-logger/helpers"
@@ -26,6 +27,7 @@ import (
 	"github.com/kubescape/kubescape/v4/core/cautils/helmprovenance"
 	"github.com/kubescape/kubescape/v4/core/pkg/filesizelimit"
 	"github.com/kubescape/kubescape/v4/core/pkg/pathcontainment"
+	"github.com/kubescape/kubescape/v4/internal/textencoding"
 	"github.com/kubescape/opa-utils/objectsenvelopes"
 	"github.com/kubescape/opa-utils/objectsenvelopes/localworkload"
 	"github.com/valyala/fastjson"
@@ -70,8 +72,9 @@ var (
 type FileFormat string
 
 const (
-	YAML_FILE_FORMAT FileFormat = "yaml"
-	JSON_FILE_FORMAT FileFormat = "json"
+	YAML_FILE_FORMAT    FileFormat = "yaml"
+	JSON_FILE_FORMAT    FileFormat = "json"
+	TerraformFileFormat FileFormat = "tf"
 
 	// DefaultMaxFileSize is the default per-file read cap for the file-scan path.
 	// 32 MiB is large enough for any legitimate manifest (the largest chart in the
@@ -778,6 +781,7 @@ func loadKustomizeDirectory(ctx context.Context, basePath string) (map[string][]
 
 	sourceToWorkloads := map[string][]workloadinterface.IMetadata{}
 	kustomizeDirectory := NewKustomizeDirectory(basePath)
+	kustomizeDirectory.onDependency, _ = ctx.Value(kustomizeDependencyObserverKey{}).(func(string, bool))
 
 	var newBasePath string
 
@@ -1160,6 +1164,16 @@ func LoadResourcesFromTerraformFiltered(ctx context.Context, basePath string, fi
 // LoadResourcesFromTerraformFilteredWithSkips also reports nested modules that
 // failed to render, so best-effort repository scans can mark coverage incomplete.
 func LoadResourcesFromTerraformFilteredWithSkips(ctx context.Context, basePath string, filter *PathFilter, workspaceOpt ...string) (map[string][]workloadinterface.IMetadata, []SkippedManifest, error) {
+	workloads, skips, _, err := LoadResourcesFromTerraformWithLocations(ctx, basePath, filter, workspaceOpt...)
+	return workloads, skips, err
+}
+
+// LoadResourcesFromTerraformWithLocations behaves like
+// LoadResourcesFromTerraformFilteredWithSkips, and also returns the start of
+// the resource block each workload was converted from, keyed by the
+// workload's path ("<file>:<index>"). The locations belong to this load only.
+func LoadResourcesFromTerraformWithLocations(ctx context.Context, basePath string, filter *PathFilter, workspaceOpt ...string) (map[string][]workloadinterface.IMetadata, []SkippedManifest, map[string]SourceLocation, error) {
+	locations := map[string]SourceLocation{}
 	var workspaceDir string
 	if len(workspaceOpt) > 0 {
 		workspaceDir = workspaceOpt[0]
@@ -1167,18 +1181,22 @@ func LoadResourcesFromTerraformFilteredWithSkips(ctx context.Context, basePath s
 
 	if IsTerraformFile(basePath) {
 		if filter.Excluded(basePath, false) {
-			return nil, nil, nil
+			return nil, nil, nil, nil
 		}
 		if workspaceDir != "" && !pathcontainment.IsPathContained(workspaceDir, basePath) {
-			return nil, nil, fmt.Errorf("%w: Terraform file %q outside workspace root", pathcontainment.ErrPathEscapesWorkspace, basePath)
+			return nil, nil, nil, fmt.Errorf("%w: Terraform file %q outside workspace root", pathcontainment.ErrPathEscapesWorkspace, basePath)
 		}
 		dir := filepath.Dir(basePath)
 		td := NewTerraformDirectory(dir, workspaceDir)
 		wls, errs := td.GetWorkloads(dir)
-		if len(errs) > 0 {
-			return wls, nil, fmt.Errorf("failed to render Terraform resources from %q: %w", dir, errors.Join(errs...))
+		if resources, ok := onlyTerraformResourceErrors(errs); ok {
+			logTerraformUnresolvedResources(ctx, dir, resources, errs)
+			return wls, []SkippedManifest{terraformUnresolvedResourcesSkip(dir, resources)}, td.SourceLocations(), nil
 		}
-		return wls, nil, nil
+		if len(errs) > 0 {
+			return wls, nil, td.SourceLocations(), fmt.Errorf("failed to render Terraform resources from %q: %w", dir, errors.Join(errs...))
+		}
+		return wls, nil, td.SourceLocations(), nil
 	}
 
 	dirs, discoveryErrs := listTerraformDirs(basePath, filter)
@@ -1186,7 +1204,7 @@ func LoadResourcesFromTerraformFilteredWithSkips(ctx context.Context, basePath s
 		logger.L().Ctx(ctx).Warning("Skipping path while discovering Terraform directories", helpers.Error(err))
 	}
 	if len(dirs) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	explicitTerraformDir := isTerraformDirectory(basePath)
@@ -1196,16 +1214,46 @@ func LoadResourcesFromTerraformFilteredWithSkips(ctx context.Context, basePath s
 	for _, dir := range dirs {
 		if workspaceDir != "" && !pathcontainment.IsPathContained(workspaceDir, dir) {
 			if explicitTerraformDir && dir == basePath {
-				return nil, skips, fmt.Errorf("%w: Terraform directory %q outside workspace root", pathcontainment.ErrPathEscapesWorkspace, dir)
+				return nil, skips, nil, fmt.Errorf("%w: Terraform directory %q outside workspace root", pathcontainment.ErrPathEscapesWorkspace, dir)
 			}
 			logger.L().Ctx(ctx).Warning("Skipping Terraform directory outside workspace root", helpers.String("path", dir))
 			continue
 		}
 		td := NewTerraformDirectory(dir, workspaceDir)
 		wls, dirErrs := td.GetWorkloads(dir)
+		maps.Copy(locations, td.SourceLocations())
+		if resources, ok := onlyTerraformResourceErrors(dirErrs); ok {
+			// Only the resources that use values the scan can't resolve were
+			// left out; the rest of the configuration is scanned.
+			logTerraformUnresolvedResources(ctx, dir, resources, dirErrs)
+			skips = append(skips, terraformUnresolvedResourcesSkip(dir, resources))
+			maps.Copy(sourceToWorkloads, wls)
+			continue
+		}
 		if len(dirErrs) > 0 {
+			// Override blocks with no primary definition are skipped without
+			// affecting the rest of the configuration, so the workloads it
+			// defines are kept. The configuration error is still reported.
+			// Resources left out for unresolved values may come with them; they
+			// are reported as well instead of dropping the whole configuration.
+			resources, resourceErrs, others := splitTerraformResourceErrors(dirErrs)
+			overridesOnly := onlyTerraformMissingOverrideTargets(others)
 			if explicitTerraformDir && dir == basePath {
-				return sourceToWorkloads, skips, fmt.Errorf("failed to render Terraform resources from %q: %w", dir, errors.Join(dirErrs...))
+				if overridesOnly {
+					maps.Copy(sourceToWorkloads, wls)
+				}
+				return sourceToWorkloads, skips, locations, fmt.Errorf("failed to render Terraform resources from %q: %w", dir, errors.Join(dirErrs...))
+			}
+			if overridesOnly {
+				logger.L().Ctx(ctx).Warning("Nested Terraform configuration has override blocks that could not be applied; scanning the resources it defines without them",
+					helpers.String("path", dir), helpers.Error(errors.Join(others...)))
+				skips = append(skips, SkippedManifest{Path: dir, Reason: "some Terraform override blocks could not be applied; see scan logs for details"})
+				if len(resources) > 0 {
+					logTerraformUnresolvedResources(ctx, dir, resources, resourceErrs)
+					skips = append(skips, terraformUnresolvedResourcesSkip(dir, resources))
+				}
+				maps.Copy(sourceToWorkloads, wls)
+				continue
 			}
 			logger.L().Ctx(ctx).Warning("Skipping nested Terraform configuration that failed to render", helpers.String("path", dir), helpers.Error(errors.Join(dirErrs...)))
 			// HCL diagnostics contain source filenames and resource labels that
@@ -1215,7 +1263,7 @@ func LoadResourcesFromTerraformFilteredWithSkips(ctx context.Context, basePath s
 		}
 		maps.Copy(sourceToWorkloads, wls)
 	}
-	return sourceToWorkloads, skips, nil
+	return sourceToWorkloads, skips, locations, nil
 }
 
 // LoadResourcesFromFiles globs input for plain YAML/JSON manifests and loads them. renderedCharts
@@ -1470,17 +1518,48 @@ func ReadFile(fileContent []byte, fileFormat FileFormat) ([]workloadinterface.IM
 	}
 }
 
-// listFiles returns the list of absolute paths, full file path and list of errors. The list of abs paths and full path have the same length
+// listFiles returns the absolute file paths and discovery errors for a scan input.
 func listFiles(pattern string, filter *PathFilter) ([]string, []error) {
-	return listFilesOrDirectories(pattern, false, filter)
+	return listFilesOrDirectories(pattern, globManifestFiles, filter)
 }
 
 // listDirs returns the list of absolute paths, full directories path and list of errors. The list of abs paths and full path have the same length
 func listDirs(pattern string, filter *PathFilter) ([]string, []error) {
-	return listFilesOrDirectories(pattern, true, filter)
+	return listFilesOrDirectories(pattern, globDirectories, filter)
 }
 
-func listFilesOrDirectories(pattern string, onlyDirectories bool, filter *PathFilter) ([]string, []error) {
+// ScanGlobPaths lists files and renderer directories selected by a scan glob.
+func ScanGlobPaths(pattern string, filter *PathFilter) ([]string, []error) {
+	files, fileErrs := listFiles(pattern, filter)
+	dirs, dirErrs := listDirs(pattern, filter)
+	for _, dir := range dirs {
+		if isScanRendererDirectory(dir) {
+			files = append(files, dir)
+		}
+	}
+	return files, append(fileErrs, dirErrs...)
+}
+
+// ScanGlobCollisionPaths lists matched manifest candidates and renderer
+// directories for report destination validation.
+func ScanGlobCollisionPaths(pattern string, filter *PathFilter) ([]string, []error) {
+	return listFilesOrDirectories(pattern, globOutputPaths, filter)
+}
+
+func isScanRendererDirectory(dir string) bool {
+	isHelm, _ := IsHelmDirectory(dir)
+	return isHelm || isKustomizeDirectory(dir) || isTerraformDirectory(dir)
+}
+
+type globPathKind uint8
+
+const (
+	globManifestFiles globPathKind = iota
+	globDirectories
+	globOutputPaths
+)
+
+func listFilesOrDirectories(pattern string, kind globPathKind, filter *PathFilter) ([]string, []error) {
 	var paths []string
 	errs := []error{}
 
@@ -1489,7 +1568,7 @@ func listFilesOrDirectories(pattern string, onlyDirectories bool, filter *PathFi
 		pattern = filepath.Join(o, pattern)
 	}
 
-	if !onlyDirectories && isFile(pattern) {
+	if kind != globDirectories && isFile(pattern) {
 		if !filter.Excluded(pattern, false) {
 			paths = append(paths, pattern)
 		}
@@ -1501,17 +1580,17 @@ func listFilesOrDirectories(pattern string, onlyDirectories bool, filter *PathFi
 		return paths, errs
 	}
 
-	root, shouldMatch := filepath.Split(pattern)
-
-	if isDir(pattern) {
-		root = pattern
-		shouldMatch = "*"
+	root, shouldMatch := pattern, "*"
+	if !isDir(pattern) {
+		root = literalDir(pattern)
+		relativePattern, err := filepath.Rel(root, pattern)
+		if err != nil {
+			return paths, append(errs, err)
+		}
+		shouldMatch = relativePattern
 	}
-	if shouldMatch == "" {
-		shouldMatch = "*"
-	}
 
-	f, err := glob(root, shouldMatch, onlyDirectories, filter)
+	f, err := glob(root, shouldMatch, kind, filter)
 	paths = append(paths, f...)
 	if err != nil {
 		errs = append(errs, err)
@@ -1576,6 +1655,14 @@ func readYamlFile(yamlFile []byte) (yamlObjs []workloadinterface.IMetadata, err 
 			err = fmt.Errorf("panic during YAML parsing: %v", r)
 		}
 	}()
+
+	// The documents are split by looking for "---" lines in the raw bytes, which
+	// UTF-16 text doesn't contain: without decoding it first, everything after
+	// the first document would be dropped with no error.
+	yamlFile, err = textencoding.DecodeUTF16(yamlFile)
+	if err != nil {
+		return yamlObjs, err
+	}
 
 	docs, splitErr := splitYAMLDocuments(yamlFile)
 
@@ -1767,6 +1854,12 @@ func readJsonFile(jsonFile []byte) (workloads []workloadinterface.IMetadata, err
 			err = fmt.Errorf("panic during JSON parsing: %v", r)
 		}
 	}()
+
+	// fastjson reads UTF-8 only.
+	jsonFile, err = textencoding.DecodeUTF16(jsonFile)
+	if err != nil {
+		return workloads, err
+	}
 
 	// A UTF-8 byte order mark is not part of the JSON text. Windows editors and
 	// PowerShell's Out-File -Encoding utf8 write one, the YAML reader skips it,
@@ -2158,10 +2251,30 @@ func IsJson(filePath string) bool {
 	return slices.Contains(JSON_PREFIX, strings.ToLower(strings.TrimPrefix(filepath.Ext(filePath), ".")))
 }
 
-func glob(root, pattern string, onlyDirectories bool, filter *PathFilter) ([]string, error) {
-	var matches []string
+// OutputCollisionFileFormat identifies files that could be scan inputs for collision checks.
+func OutputCollisionFileFormat(filePath string) FileFormat {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	switch {
+	case ext == ".tf":
+		return TerraformFileFormat
+	case ext == ".json" || IsJson(filePath):
+		return JSON_FILE_FORMAT
+	case ext == ".yaml" || ext == ".yml" || IsYaml(filePath):
+		return YAML_FILE_FORMAT
+	default:
+		return ""
+	}
+}
 
-	// filepath.Walk does not follow symlinks, the root included, so a scan of a
+func glob(root, pattern string, kind globPathKind, filter *PathFilter) ([]string, error) {
+	var matches, rendererDirs []string
+	// Basename-only patterns have historically matched at every depth.
+	separator := string(filepath.Separator)
+	patternSeparators := strings.Count(pattern, separator)
+	matchRelativePath := patternSeparators > 0
+	fixedDepth := matchRelativePath && !strings.Contains(pattern, "**")
+
+	// filepath.WalkDir does not follow symlinks, the root included, so a scan of a
 	// directory given as a symlink (a linked checkout, say) would list nothing.
 	// Walk its target and report each path under the root as given, which is
 	// the form the rest of the scan keeps.
@@ -2172,7 +2285,7 @@ func glob(root, pattern string, onlyDirectories bool, filter *PathFilter) ([]str
 		}
 	}
 
-	err := filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
+	err := filepath.WalkDir(walkRoot, func(path string, entry os.DirEntry, err error) error {
 		if walkRoot != root {
 			if rel, relErr := filepath.Rel(walkRoot, path); relErr == nil {
 				path = filepath.Join(root, rel)
@@ -2182,45 +2295,110 @@ func glob(root, pattern string, onlyDirectories bool, filter *PathFilter) ([]str
 			return err
 		}
 
-		if filter.Excluded(path, info.IsDir()) {
-			if info.IsDir() {
+		isDirectory := entry.IsDir()
+		checkSymlink := kind == globOutputPaths && matchRelativePath && entry.Type()&os.ModeSymlink != 0
+		excluded := filter.Excluded(path, isDirectory)
+		if excluded && !checkSymlink {
+			if isDirectory {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		// listing only directories
-		if onlyDirectories {
-			if info.IsDir() {
-				if matched, err := filepath.Match(pattern, filepath.Base(path)); err != nil {
-					return err
-				} else if matched {
-					matches = append(matches, path)
-				}
+		match, name := filepath.Match, filepath.Base(path)
+		var next error
+		if matchRelativePath {
+			name, err = filepath.Rel(root, path)
+			if err != nil {
+				return err
 			}
-			return nil
+			match = doublestar.PathMatch
+			if fixedDepth && isDirectory && strings.Count(name, separator) >= patternSeparators {
+				next = filepath.SkipDir
+			}
 		}
-
-		// listing only files
-		if info.IsDir() {
-			return nil
+		if kind == globOutputPaths {
+			if checkSymlink {
+				matches = append(matches, globFilesThroughSymlink(path, name, pattern, filter)...)
+			}
+			if excluded || !isDirectory && OutputCollisionFileFormat(path) == "" {
+				return next
+			}
+		} else if isDirectory != (kind == globDirectories) || (!isDirectory && !IsYaml(path) && !IsJson(path)) {
+			return next
 		}
-		fileFormat := getFileFormat(path)
-		if fileFormat != JSON_FILE_FORMAT && fileFormat != YAML_FILE_FORMAT {
-			return nil
+		matched, err := match(pattern, name)
+		if err != nil && matchRelativePath {
+			// Legacy globs (such as an unclosed '{') can fail doublestar parsing even though filepath.Match accepts them as literals.
+			if fallbackMatched, fallbackErr := filepath.Match(pattern, name); fallbackErr == nil {
+				matched, err = fallbackMatched, nil
+			}
 		}
-		if matched, err := filepath.Match(pattern, filepath.Base(path)); err != nil {
+		if err != nil {
 			return err
-		} else if matched {
+		}
+		if !matched && kind == globOutputPaths && matchRelativePath && !isDirectory {
+			// Legacy direct file matches can use syntax with different meanings in doublestar.
+			matched, _ = filepath.Match(pattern, name)
+		}
+		if !matched {
+			return next
+		}
+		if kind == globOutputPaths && isDirectory {
+			if isScanRendererDirectory(path) {
+				rendererDirs = append(rendererDirs, path)
+			}
+		} else if kind != globOutputPaths || isGlobRegularFile(path, entry) {
 			matches = append(matches, path)
 		}
-
-		return nil
+		return next
 	})
-	if err != nil {
-		return matches, err
+	return append(matches, rendererDirs...), err
+}
+
+// globFilesThroughSymlink keeps the bounded directory-symlink matches of filepath.Glob.
+func globFilesThroughSymlink(link, relativePath, pattern string, filter *PathFilter) []string {
+	separator := string(filepath.Separator)
+	depth := strings.Count(relativePath, separator) + 1
+	parts := strings.SplitN(pattern, separator, depth+1)
+	if len(parts) <= depth {
+		return nil
 	}
-	return matches, nil
+	matched, _ := filepath.Match(strings.Join(parts[:depth], separator), relativePath)
+	if !matched || filter.Excluded(link, true) || !isDir(link) {
+		return nil
+	}
+	return globFilesAtFixedDepth(link, parts[depth], filter)
+}
+
+func globFilesAtFixedDepth(dir, pattern string, filter *PathFilter) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		// filepath.Glob skips directories it cannot read.
+		return nil
+	}
+
+	component, remaining, nested := strings.Cut(pattern, string(filepath.Separator))
+	var matches []string
+	for _, entry := range entries {
+		matched, _ := filepath.Match(component, entry.Name())
+		if !matched {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		if nested {
+			if !filter.Excluded(path, true) && (entry.IsDir() || entry.Type()&os.ModeSymlink != 0 && isDir(path)) {
+				matches = append(matches, globFilesAtFixedDepth(path, remaining, filter)...)
+			}
+		} else if OutputCollisionFileFormat(path) != "" && !filter.Excluded(path, false) && isGlobRegularFile(path, entry) {
+			matches = append(matches, path)
+		}
+	}
+	return matches
+}
+
+func isGlobRegularFile(path string, entry os.DirEntry) bool {
+	return entry.Type().IsRegular() || entry.Type()&os.ModeSymlink != 0 && isFile(path)
 }
 
 // isFile checks if a given path is a file
@@ -2251,4 +2429,12 @@ func getFileFormat(filePath string) FileFormat {
 	} else {
 		return FileFormat(filePath)
 	}
+}
+
+// logTerraformUnresolvedResources warns that the resources of the Terraform
+// configuration in dir that use values the scan can't resolve were left out,
+// naming them and the reasons.
+func logTerraformUnresolvedResources(ctx context.Context, dir string, resources []string, errs []error) {
+	logger.L().Ctx(ctx).Warning("Scanning Terraform configuration without the resources that use values that can't be resolved",
+		helpers.String("path", dir), helpers.String("resources", strings.Join(resources, ", ")), helpers.Error(errors.Join(errs...)))
 }

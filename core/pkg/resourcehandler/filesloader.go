@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	giturl "github.com/kubescape/go-git-url"
 	"github.com/kubescape/go-logger"
@@ -69,7 +70,8 @@ func (fileHandler *FileResourceHandler) GetResources(ctx context.Context, sessio
 					ignoreFile = ignoreErr.Path
 				}
 			} else {
-				input.root, input.sources, input.workloads, skipped, err = getResourcesFromInput(ctx, scanInfo.InputPatterns[path], helmValueOpts, pathFilter, cloneDepth, scanInfo.WorkspaceDir)
+				input.terraformLocations = map[string]cautils.SourceLocation{}
+				input.root, input.sources, input.workloads, skipped, err = getResourcesFromInput(ctx, scanInfo.InputPatterns[path], helmValueOpts, pathFilter, cloneDepth, input.terraformLocations, scanInfo.WorkspaceDir)
 				input.remote = remoteName(scanInfo.InputPatterns[path], cloneDepth)
 			}
 		}
@@ -102,6 +104,12 @@ func (fileHandler *FileResourceHandler) GetResources(ctx context.Context, sessio
 	anchorInputs(ctx, inputs)
 	for _, input := range inputs {
 		maps.Copy(sessionObj.ResourceSource, input.sources)
+		if len(input.terraformLocations) > 0 {
+			if sessionObj.TerraformSourceLocations == nil {
+				sessionObj.TerraformSourceLocations = map[string]cautils.SourceLocation{}
+			}
+			maps.Copy(sessionObj.TerraformSourceLocations, input.terraformLocations)
+		}
 
 		// map all resources: map["/apiVersion/version/kind"][]<k8s workloads>
 		addWorkloadsToResourcesMap(mappedResources, input.workloads)
@@ -165,6 +173,9 @@ type loadedInput struct {
 	remote    string // stable name of a cloned remote repository; "" for a local input
 	sources   map[string]reporthandling.Source
 	workloads []workloadinterface.IMetadata
+	// terraformLocations is the Terraform resource block of each resource
+	// converted from a .tf file, by resource ID.
+	terraformLocations map[string]cautils.SourceLocation
 }
 
 // anchorInputs keeps the resources of a scan with several roots apart.
@@ -416,24 +427,43 @@ func pathFilterFromScanInfo(ctx context.Context, input string, scanInfo *cautils
 
 func getWorkloadFromHelmChart(ctx context.Context, path, helmPath, workloadPath string, helmValueOpts cautils.HelmValueOptions, cloneDepth int, workspaceOpt ...string) (map[string]reporthandling.Source, []workloadinterface.IMetadata, error) {
 	clonedRepo := cautils.GetClonedPath(path, cloneDepth)
-
 	if clonedRepo != "" {
-		// if the repo was cloned, add the workload path to the cloned repo
 		workloadPath = filepath.Join(clonedRepo, workloadPath)
-	} else {
-		// if the repo was not cloned
-		clonedRepo = path
 	}
-
-	// Get repo root
-	repoRoot, gitRepo := extractGitRepo(clonedRepo)
 
 	helmSourceToWorkloads, helmSourceToChart, _, err := cautils.LoadResourcesFromHelmChartsFiltered(ctx, helmPath, helmValueOpts, nil, nil, workspaceOpt...)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	wlSource, ok := helmSourceToWorkloads[workloadPath]
+	templatePath := workloadPath
+	if clonedRepo == "" {
+		templatePath, err = filepath.Abs(workloadPath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("resolve Helm workload path %q: %w", workloadPath, err)
+		}
+	}
+
+	wlSource, ok := helmSourceToWorkloads[templatePath]
+	if ok && clonedRepo == "" {
+		// filepath.Abs can collapse "link/.." before the filesystem resolves the symlink.
+		requested, statErr := os.Stat(workloadPath)
+		if statErr == nil {
+			template, templateErr := os.Stat(templatePath)
+			ok = templateErr == nil && os.SameFile(requested, template)
+		} else {
+			// A packaged template's path can be missing or have a non-directory component.
+			ok = errors.Is(statErr, os.ErrNotExist) || errors.Is(statErr, syscall.ENOTDIR)
+		}
+	}
+	if !ok && clonedRepo == "" {
+		var ambiguous bool
+		templatePath, ambiguous = findLocalHelmTemplateAlias(workloadPath, helmSourceToWorkloads, workspaceOpt...)
+		if ambiguous {
+			return nil, nil, fmt.Errorf("workload %s matches multiple templates in chart %s", workloadPath, helmPath)
+		}
+		wlSource, ok = helmSourceToWorkloads[templatePath]
+	}
 	if !ok {
 		return nil, nil, fmt.Errorf("workload %s not found in chart %s", workloadPath, helmPath)
 	}
@@ -442,12 +472,17 @@ func getWorkloadFromHelmChart(ctx context.Context, path, helmPath, workloadPath 
 		return nil, nil, fmt.Errorf("workload %s found multiple times in chart %s", workloadPath, helmPath)
 	}
 
-	helmChart, ok := helmSourceToChart[workloadPath]
+	helmChart, ok := helmSourceToChart[templatePath]
 	if !ok {
 		return nil, nil, fmt.Errorf("helmChart not found for workload %s", workloadPath)
 	}
 
-	workloadSource := getWorkloadSourceHelmChart(repoRoot, helmPath, gitRepo, helmChart)
+	repoPath := filepath.Dir(templatePath)
+	if clonedRepo != "" {
+		repoPath = clonedRepo
+	}
+	repoRoot, gitRepo := extractGitRepo(repoPath)
+	workloadSource := getWorkloadSourceHelmChart(repoRoot, templatePath, gitRepo, helmChart)
 
 	workloadIDToSource := make(map[string]reporthandling.Source, 1)
 	workloadIDToSource[wlSource[0].GetID()] = workloadSource
@@ -457,6 +492,27 @@ func getWorkloadFromHelmChart(ctx context.Context, path, helmPath, workloadPath 
 
 	return workloadIDToSource, workloads, nil
 
+}
+
+func findLocalHelmTemplateAlias(workloadPath string, templates map[string][]workloadinterface.IMetadata, workspaceOpt ...string) (match string, ambiguous bool) {
+	if len(workspaceOpt) > 0 && workspaceOpt[0] != "" && !pathcontainment.IsPathContained(workspaceOpt[0], workloadPath) {
+		return "", false
+	}
+	requested, err := os.Stat(workloadPath)
+	if err != nil || !requested.Mode().IsRegular() {
+		return "", false
+	}
+	for templatePath := range templates {
+		template, err := os.Stat(templatePath)
+		if err != nil || !os.SameFile(requested, template) {
+			continue
+		}
+		if match != "" {
+			return "", true
+		}
+		match = templatePath
+	}
+	return match, false
 }
 
 func getWorkloadSourceHelmChart(repoRoot string, source string, gitRepo *cautils.LocalGitRepository, helmChart cautils.Chart) reporthandling.Source {
@@ -527,14 +583,16 @@ func excludeFilesUnderDirectories(sourceToWorkloads map[string][]workloadinterfa
 // source file it came from. When workspace containment is configured via workspaceOpt,
 // external references and symlinks outside the workspace are contained or skipped.
 func getResourcesFromPath(ctx context.Context, path string, helmValueOpts cautils.HelmValueOptions, pathFilter *cautils.PathFilter, workspaceOpt ...string) (map[string]reporthandling.Source, []workloadinterface.IMetadata, []cautils.SkippedManifest, error) {
-	_, workloadIDToSource, workloads, skips, err := getResourcesFromInput(ctx, path, helmValueOpts, pathFilter, cautils.DefaultGitCloneDepth, workspaceOpt...)
+	_, workloadIDToSource, workloads, skips, err := getResourcesFromInput(ctx, path, helmValueOpts, pathFilter, cautils.DefaultGitCloneDepth, nil, workspaceOpt...)
 	return workloadIDToSource, workloads, skips, err
 }
 
 // getResourcesFromInput loads one scan input. It also returns the local root the
 // input's paths are reported against, or "" for a cloned remote repository, whose
-// temporary checkout must not leak into resource IDs.
-func getResourcesFromInput(ctx context.Context, path string, helmValueOpts cautils.HelmValueOptions, pathFilter *cautils.PathFilter, cloneDepth int, workspaceOpt ...string) (string, map[string]reporthandling.Source, []workloadinterface.IMetadata, []cautils.SkippedManifest, error) {
+// temporary checkout must not leak into resource IDs. When terraformLocations
+// is not nil, it is filled with the Terraform resource block of each resource
+// converted from a .tf file, by resource ID.
+func getResourcesFromInput(ctx context.Context, path string, helmValueOpts cautils.HelmValueOptions, pathFilter *cautils.PathFilter, cloneDepth int, terraformLocations map[string]cautils.SourceLocation, workspaceOpt ...string) (string, map[string]reporthandling.Source, []workloadinterface.IMetadata, []cautils.SkippedManifest, error) {
 	var workspaceDir string
 	if len(workspaceOpt) > 0 {
 		workspaceDir = workspaceOpt[0]
@@ -552,7 +610,7 @@ func getResourcesFromInput(ctx context.Context, path string, helmValueOpts cauti
 
 	// Get repo root. A glob input is not a path on disk: anchor it at the
 	// directory file discovery walks, as the ignore file and --watch already do.
-	rootInput, _ := cautils.GlobInputRoot(path)
+	rootInput, isGlob := cautils.GlobInputRoot(path)
 	repoRoot, gitRepo := extractGitRepo(rootInput)
 
 	// when scanning a single file, we consider the repository root to be
@@ -593,27 +651,26 @@ func getResourcesFromInput(ctx context.Context, path string, helmValueOpts cauti
 	// generic Helm renderer left them alone. CRDs are filtered separately according
 	// to includeCRDs, so an omitted CRD remains available to the raw-file pass.
 	coveredChartDirectories := append(append([]string{}, renderedCharts...), ownedHelmCharts...)
-	sourceToWorkloads, fileSkips, err := cautils.LoadResourcesFromFilesFiltered(ctx, path, repoRoot, coveredChartDirectories, pathFilter, workspaceDir)
+	sourceToWorkloads, fileSkips, filesErr := cautils.LoadResourcesFromFilesFiltered(ctx, path, repoRoot, coveredChartDirectories, pathFilter, workspaceDir)
 	allSkips = append(allSkips, fileSkips...)
-	filesErr := err
-	if err != nil && !errors.Is(err, cautils.ErrNoManifestFiles) {
-		return "", nil, nil, allSkips, err
+	if filesErr != nil && !errors.Is(filesErr, cautils.ErrNoManifestFiles) {
+		if !errors.Is(filesErr, cautils.ErrManifestsNotLoaded) {
+			return "", nil, nil, allSkips, filesErr
+		}
+		// A directory or glob can still have resources from the other loaders.
+		// A malformed file named as the input must still fail immediately.
+		if !isGlob {
+			info, statErr := os.Stat(path)
+			if statErr != nil || !info.IsDir() {
+				return "", nil, nil, allSkips, filesErr
+			}
+		}
 	}
-	terraformSourceToWorkloads, terraformSkips, err := cautils.LoadResourcesFromTerraformFilteredWithSkips(ctx, path, pathFilter, workspaceDir)
+	terraformSourceToWorkloads, terraformSkips, terraformPathLocations, err := cautils.LoadResourcesFromTerraformWithLocations(ctx, path, pathFilter, workspaceDir)
 	allSkips = append(allSkips, terraformSkips...)
 	if err != nil {
 		return "", nil, nil, allSkips, err
 	}
-	if filesErr != nil {
-		terraformWorkloads := 0
-		for _, ws := range terraformSourceToWorkloads {
-			terraformWorkloads += len(ws)
-		}
-		if terraformWorkloads == 0 {
-			return "", nil, nil, allSkips, filesErr
-		}
-	}
-
 	// merge Terraform-derived workloads, same pattern as the Kustomize block below
 	for source, ws := range terraformSourceToWorkloads {
 		workloads = append(workloads, ws...)
@@ -654,6 +711,14 @@ func getResourcesFromInput(ctx context.Context, path string, helmValueOpts cauti
 
 		for i := range ws {
 			workloadIDToSource[ws[i].GetID()] = workloadSource
+			if terraformLocations == nil {
+				continue
+			}
+			if lw, ok := ws[i].(*localworkload.LocalWorkload); ok {
+				if location, ok := terraformPathLocations[lw.GetPath()]; ok {
+					terraformLocations[ws[i].GetID()] = location
+				}
+			}
 		}
 	}
 
@@ -811,7 +876,13 @@ func getResourcesFromInput(ctx context.Context, path string, helmValueOpts cauti
 	// Successful renderers already exclude their owned raw inputs. Preserve all
 	// remaining sources, even when their Kubernetes identities match.
 	if len(workloads) == 0 {
+		if filesErr != nil {
+			return "", nil, nil, allSkips, filesErr
+		}
 		return "", nil, nil, allSkips, fmt.Errorf("%w for input %q", ErrNoScannableResources, path)
+	}
+	if errors.Is(filesErr, cautils.ErrManifestsNotLoaded) {
+		logger.L().Ctx(ctx).Warning("Skipping invalid manifest files", helpers.Error(filesErr))
 	}
 
 	inputRoot := repoRoot

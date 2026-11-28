@@ -29,6 +29,7 @@ import (
 	"github.com/kubescape/kubescape/v4/core/pkg/fixhandler"
 	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling/locationresolver"
 	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling/printer"
+	"github.com/kubescape/opa-utils/objectsenvelopes"
 	"github.com/kubescape/opa-utils/objectsenvelopes/localworkload"
 	"github.com/kubescape/opa-utils/reporthandling"
 	"github.com/kubescape/opa-utils/reporthandling/apis"
@@ -130,10 +131,10 @@ func (sp *SARIFPrinter) addRule(scanRun *sarif.Run, control reportsummary.IContr
 // reviewPathLocations, when non-empty, adds one relatedLocation per resolved ReviewPath so each
 // field that actually caused the failure gets its own precise location in the manifest, distinct
 // from the single primary location (which points at the fix, not necessarily at every failed field).
-func (sp *SARIFPrinter) createResult(ctl reportsummary.IControlSummary, filepath string, location locationresolver.Location, ac *resourcesresults.ResourceAssociatedControl, resourceID string, resource workloadinterface.IMetadata, reviewPathLocations map[string]locationresolver.Location, prioritized *prioritization.PrioritizedResource) *sarif.Result {
+func (sp *SARIFPrinter) createResult(ctl reportsummary.IControlSummary, filepath string, location locationresolver.Location, ac *resourcesresults.ResourceAssociatedControl, resourceID string, resource workloadinterface.IMetadata, reviewPathLocations map[string]locationresolver.Location, prioritized *prioritization.PrioritizedResource, preserved ...map[string]string) *sarif.Result {
 	msg := ctl.GetDescription()
 	if resource != nil {
-		if paths := AssistedRemediationPathsWithCurrentValuesFiltered(ac, resource, sp.showSecrets); len(paths) > 0 {
+		if paths := AssistedRemediationPathsWithCurrentValuesFiltered(ac, resource, sp.showSecrets, preserved...); len(paths) > 0 {
 			addContainerNameToAssistedRemediation(resource, &paths)
 			msg += "\n\nAffected fields:\n" + strings.Join(paths, "\n")
 		}
@@ -763,7 +764,8 @@ func (sp *SARIFPrinter) configurationResult(ctx context.Context, opaSessionObj *
 			prioritized = &pr
 		}
 	}
-	r := sp.createResult(ctl, resource.relPath, location, &ac, resource.resourceID, rsrc, reviewPathLocations, prioritized)
+	r := sp.createResult(ctl, resource.relPath, location, &ac, resource.resourceID, rsrc, reviewPathLocations, prioritized, opaSessionObj.PreservedValuesForResource(resource.resourceID))
+	addRBACSubjectRelatedLocations(r, opaSessionObj, cache, &ac, resource.resourceID)
 	r.WithRuleIndex(ruleIndexes[ctl.GetID()])
 	// kind stays "" when rsrc is nil (the resource lookup missed) --
 	// collectFixes below treats an unresolved kind as sensitive,
@@ -806,7 +808,7 @@ func (sp *SARIFPrinter) writeConfigurationSARIF(ctx context.Context, w io.Writer
 			continue
 		}
 
-		resourceSource := opaSessionObj.ResourceSource[resourceID]
+		resourceSource := reportedSource(opaSessionObj, resourceID)
 		relPath := resourceSource.RelativePath
 
 		// Github Code Scanning considers results not associated to a file path
@@ -1043,15 +1045,20 @@ func resolveFixLocation(opaSessionObj *cautils.OPASessionObj, locationResolver *
 }
 
 func lookupFixLocation(opaSessionObj *cautils.OPASessionObj, locationResolver *locationresolver.PathLocationResolver, ac *resourcesresults.ResourceAssociatedControl, resourceID string) (locationresolver.Location, bool) {
+	// Terraform files have no YAML node tree to resolve fix paths in, so point
+	// at the resource block the workload was converted from.
+	if location, ok := terraformResourceLocation(opaSessionObj, resourceID); ok {
+		return location, true
+	}
 	if locationResolver == nil {
 		return locationresolver.Location{}, false
 	}
 	fixPaths := AssistedRemediationPathsToString(ac)
-	if len(fixPaths) == 0 || fixPaths[0] == "" {
-		return locationresolver.Location{}, false
-	}
 	docIndex, ok := getDocIndex(opaSessionObj, resourceID)
 	if !ok {
+		docIndex, fixPaths, ok = rbacSubjectPaths(opaSessionObj, resourceID, fixPaths)
+	}
+	if !ok || len(fixPaths) == 0 || fixPaths[0] == "" {
 		return locationresolver.Location{}, false
 	}
 	location, _ := locationResolver.ResolveLocation(fixPaths[0], docIndex)
@@ -1238,6 +1245,20 @@ func collectFixes(ctx context.Context, cache *fixReportCache, result *sarif.Resu
 	}
 }
 
+// terraformResourceLocation returns the start of the Terraform resource block
+// a resource was converted from. It reports false for resources that didn't
+// come from a Terraform file.
+func terraformResourceLocation(opaSessionObj *cautils.OPASessionObj, resourceID string) (locationresolver.Location, bool) {
+	if opaSessionObj == nil {
+		return locationresolver.Location{}, false
+	}
+	source, ok := opaSessionObj.TerraformSourceLocations[resourceID]
+	if !ok {
+		return locationresolver.Location{}, false
+	}
+	return locationresolver.Location{Line: source.Line, Column: source.Column}, true
+}
+
 func getDocIndex(opaSessionObj *cautils.OPASessionObj, resourceID string) (int, bool) {
 	resource, ok := opaSessionObj.GetResource(resourceID)
 	if !ok || resource == nil {
@@ -1271,6 +1292,140 @@ func getDocIndex(opaSessionObj *cautils.OPASessionObj, resourceID string) (int, 
 		return 0, false
 	}
 	return docIndex, true
+}
+
+// rbacSubjectBinding returns the binding an RBAC subject was built from, and its
+// index in the subject's relatedObjects. A scan builds a subject from a binding and
+// a role, so the subject has no manifest of its own: it is reported where the
+// binding names it.
+func rbacSubjectBinding(resource workloadinterface.IMetadata) (workloadinterface.IMetadata, int, bool) {
+	subject, ok := resource.(*objectsenvelopes.RegoResponseVectorObject)
+	if !ok {
+		return nil, 0, false
+	}
+	for i, related := range subject.GetRelatedObjects() {
+		if strings.HasSuffix(related.GetKind(), "Binding") {
+			return related, i, true
+		}
+	}
+	return nil, 0, false
+}
+
+// reportedSource returns the manifest a failed resource is reported in. An RBAC
+// subject without a source of its own uses its binding's.
+func reportedSource(opaSessionObj *cautils.OPASessionObj, resourceID string) reporthandling.Source {
+	if opaSessionObj == nil || opaSessionObj.ResourceSource == nil {
+		return reporthandling.Source{}
+	}
+	source := opaSessionObj.ResourceSource[resourceID]
+	if source.RelativePath != "" {
+		return source
+	}
+	resource, _ := opaSessionObj.GetResource(resourceID)
+	if binding, _, ok := rbacSubjectBinding(resource); ok {
+		return opaSessionObj.ResourceSource[binding.GetID()]
+	}
+	return source
+}
+
+// rbacSubjectPaths returns the binding's document and the subject's paths inside
+// it. A subject's paths are written as relatedObjects[i].<path>, and only the
+// binding's can be resolved in the binding's document. The subject's own entry
+// comes first whatever order the rule reports, followed by roleRef.name and then
+// any other binding paths; a rule with no binding path falls back to kind.
+func rbacSubjectPaths(opaSessionObj *cautils.OPASessionObj, resourceID string, paths []string) (int, []string, bool) {
+	resource, _ := opaSessionObj.GetResource(resourceID)
+	binding, index, ok := rbacSubjectBinding(resource)
+	if !ok {
+		return 0, nil, false
+	}
+	docIndex, ok := getDocIndex(opaSessionObj, binding.GetID())
+	if !ok {
+		return 0, nil, false
+	}
+	prefix := fmt.Sprintf("relatedObjects[%d].", index)
+	var subjectPaths, roleRefPaths, otherPaths []string
+	for _, path := range paths {
+		rest, found := strings.CutPrefix(path, prefix)
+		switch {
+		case !found:
+		case strings.HasPrefix(rest, "subjects["):
+			subjectPaths = append(subjectPaths, rest)
+		case rest == "roleRef.name":
+			roleRefPaths = append(roleRefPaths, rest)
+		default:
+			otherPaths = append(otherPaths, rest)
+		}
+	}
+	bindingPaths := append(append(subjectPaths, roleRefPaths...), otherPaths...)
+	if len(bindingPaths) == 0 {
+		bindingPaths = []string{"kind"}
+	}
+	return docIndex, bindingPaths, true
+}
+
+// addRBACSubjectRelatedLocations points an RBAC subject's finding at the fields
+// of its binding and role that caused it, each in its own manifest: a role is
+// often in a different file from the binding that grants it. A role's file is
+// decoded into the binding file's cache, so it is dropped with it.
+func addRBACSubjectRelatedLocations(result *sarif.Result, opaSessionObj *cautils.OPASessionObj, cache *fixReportCache, ac *resourcesresults.ResourceAssociatedControl, resourceID string) {
+	resource, _ := opaSessionObj.GetResource(resourceID)
+	if _, _, ok := rbacSubjectBinding(resource); !ok || cache == nil {
+		return
+	}
+	related := resource.(*objectsenvelopes.RegoResponseVectorObject).GetRelatedObjects()
+	basePath := getBasePathFromMetadata(opaSessionObj)
+
+	var paths []string
+	for i := range ac.ResourceAssociatedRules {
+		if !cautils.RuleStatus(&opaSessionObj.Report.SummaryDetails, ac.GetID(), &ac.ResourceAssociatedRules[i]).IsFailed() {
+			continue
+		}
+		for _, p := range ac.ResourceAssociatedRules[i].Paths {
+			if p.ReviewPath != "" && !slices.Contains(paths, p.ReviewPath) {
+				paths = append(paths, p.ReviewPath)
+			}
+		}
+	}
+	sort.Strings(paths)
+
+	for _, path := range paths {
+		inner, found := strings.CutPrefix(path, "relatedObjects[")
+		number, rest, cut := strings.Cut(inner, "].")
+		index, err := strconv.Atoi(number)
+		if !found || !cut || err != nil || index < 0 || index >= len(related) {
+			continue
+		}
+		object := related[index]
+		source := opaSessionObj.ResourceSource[object.GetID()]
+		if source.RelativePath == "" {
+			continue
+		}
+		// a Terraform file has no YAML tree, so point at its resource block
+		location, ok := terraformResourceLocation(opaSessionObj, object.GetID())
+		if !ok {
+			docIndex, found := getDocIndex(opaSessionObj, object.GetID())
+			if !found {
+				continue
+			}
+			resolver := cache.locationResolver(filepath.Join(effectiveBasePath(source, basePath), source.RelativePath), "SARIF")
+			if resolver == nil {
+				continue
+			}
+			if location, err = resolver.ResolveLocation(rest, docIndex); err != nil || location.Line == 0 {
+				continue
+			}
+		}
+		result.AddRelatedLocation(
+			sarif.NewLocation().
+				WithMessage(sarif.NewTextMessage(path)).
+				WithPhysicalLocation(
+					sarif.NewPhysicalLocation().
+						WithArtifactLocation(sarif.NewSimpleArtifactLocation(filepath.ToSlash(source.RelativePath))).
+						WithRegion(sarif.NewRegion().WithStartLine(location.Line).WithStartColumn(location.Column)),
+				),
+		)
+	}
 }
 
 func getBasePathFromMetadata(opaSessionObj *cautils.OPASessionObj) string {

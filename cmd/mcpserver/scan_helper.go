@@ -68,8 +68,9 @@ type scanRequest struct {
 	// rsrcHandler overrides resource collection. Nil means build a
 	// K8sResourceHandler against the live cluster; a FileResourceHandler here is
 	// what makes the local-manifest scans work.
-	rsrcHandler   resourcehandler.IResourceHandler
-	inputPatterns []string
+	rsrcHandler      resourcehandler.IResourceHandler
+	inputPatterns    []string
+	inMemoryManifest bool
 	// customGetters replaces the policy getters wholesale. Nil means derive them
 	// from the server's own policy getter.
 	customGetters *cautils.Getters
@@ -231,12 +232,13 @@ func runScan(ctx context.Context, ksServer *KubescapeMcpserver, req scanRequest)
 	}
 
 	limit := maxFailedResources
-	if full, _ := ctx.Value(fullScanResultsKey{}).(bool); full {
-		limit = len(scanData.ResourcesResult)
-	} else if req.limit > 0 {
+	prepared, _ := ctx.Value(preparedScanResultsKey{}).(*preparedScanResults)
+	// Shared execution must cover the largest supported page. Each caller
+	// applies its own limit after the shared result is available.
+	if prepared == nil && req.limit > 0 {
 		limit = req.limit
 	}
-	response := buildScanResponseWithLimit(summary, scanData.ResourcesResult, complianceScore, frameworkName, degraded, notEvaluated, totalControls, limit)
+	response, ordered := buildRankedScanResponse(summary, scanData.ResourcesResult, complianceScore, frameworkName, degraded, notEvaluated, totalControls, limit)
 	if req.namespaceDefaulted && req.scanObject != nil {
 		response.Warning = "Workload namespace was omitted and defaulted to 'default'. If your workload is in another namespace, specify 'namespace' explicitly or pass '*' to search cluster-wide."
 		response.TargetResource = &TargetResourceInfo{
@@ -252,7 +254,20 @@ func runScan(ctx context.Context, ksServer *KubescapeMcpserver, req scanRequest)
 		helpers.Int("returned_resources", response.ReturnedFailed),
 	)
 
-	responseJSON, err := json.MarshalIndent(response, "", "  ")
+	if prepared != nil {
+		if response.Truncated {
+			if err := prepared.buildSnapshot(response, len(ordered), func(i int) any {
+				return scanData.ResourcesResult[ordered[i].key]
+			}); err != nil {
+				return nil, err
+			}
+		}
+		if prepared.oversized {
+			response.PaginationWarning = "Full results could not be retained (retention limit exceeded); narrow the scan scope."
+		}
+	}
+
+	responseJSON, err := json.Marshal(response)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal %s scan results: %w", req.label, err)
 	}
@@ -298,6 +313,7 @@ func buildScanInfo(req scanRequest) *cautils.ScanInfo {
 		ExcludedNamespaces: req.excludedNamespaces,
 		ScanTimeout:        timeout,
 		InputPatterns:      req.inputPatterns,
+		InMemoryManifest:   req.inMemoryManifest,
 		ScanObject:         req.scanObject,
 		WorkspaceDir:       req.workspaceDir,
 		IncludeKinds:       req.includeKinds,
@@ -331,14 +347,20 @@ func buildScanResponse(summary *reportsummary.SummaryDetails, results map[string
 }
 
 func buildScanResponseWithLimit(summary *reportsummary.SummaryDetails, results map[string]resourcesresults.Result, complianceScore *float32, frameworkName string, degraded bool, notEvaluated int, totalControls, limit int) scanResponse {
-	type rankedResource struct {
-		key  string
-		rank int
-	}
-	failed := make([]rankedResource, 0, len(results))
+	response, _ := buildRankedScanResponse(summary, results, complianceScore, frameworkName, degraded, notEvaluated, totalControls, limit)
+	return response
+}
+
+type rankedScanResource struct {
+	key  string
+	rank int
+}
+
+func buildRankedScanResponse(summary *reportsummary.SummaryDetails, results map[string]resourcesresults.Result, complianceScore *float32, frameworkName string, degraded bool, notEvaluated int, totalControls, limit int) (scanResponse, []rankedScanResource) {
+	failed := make([]rankedScanResource, 0, len(results))
 	for k, result := range results {
 		if cautils.ResourceStatus(summary, &result).IsFailed() {
-			failed = append(failed, rankedResource{
+			failed = append(failed, rankedScanResource{
 				key:  k,
 				rank: resourceMaxSeverityRank(summary, &result),
 			})
@@ -373,5 +395,5 @@ func buildScanResponseWithLimit(summary *reportsummary.SummaryDetails, results m
 		ReturnedFailed:       len(failedResources),
 		Truncated:            totalFailed > limit,
 		FailedResources:      failedResources,
-	}
+	}, failed
 }

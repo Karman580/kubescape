@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -203,9 +204,11 @@ func TestSaveInFile(t *testing.T) {
 
 		require.EqualValues(t, policy, retrieved)
 
-		info, err := os.Stat(target)
-		require.NoError(t, err)
-		require.Equal(t, savedJSONFileMode, info.Mode().Perm())
+		if runtime.GOOS != "windows" { // Windows has no Unix permission bits
+			info, err := os.Stat(target)
+			require.NoError(t, err)
+			require.Equal(t, savedJSONFileMode, info.Mode().Perm())
+		}
 	})
 
 	t.Run("should save data as JSON (new target folder)", func(t *testing.T) {
@@ -257,6 +260,9 @@ func TestSaveInFilePreservesExistingFileWhenCommitFails(t *testing.T) {
 }
 
 func TestSaveInFilePreservesExistingPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no Unix permission bits")
+	}
 	target := filepath.Join(t.TempDir(), "controls.json")
 	require.NoError(t, os.WriteFile(target, []byte(`{"old":true}`), 0o600))
 
@@ -322,7 +328,7 @@ func TestSaveInFileConcurrentWritersAlwaysPublishCompleteJSON(t *testing.T) {
 	}()
 
 	for {
-		contents, err := os.ReadFile(target)
+		contents, err := readPolicyFile(target)
 		require.NoError(t, err)
 		var published map[string]any
 		require.NoError(t, json.Unmarshal(contents, &published), "readers must never observe a partially written cache entry")

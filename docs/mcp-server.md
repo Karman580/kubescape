@@ -734,6 +734,71 @@ Run an on-demand, live Network security scan (evaluating network-related control
 }
 ```
 
+#### `analyze_admission_webhook_coverage`
+
+Run an on-demand, live scan and report which validating and mutating admission webhooks would match a synthetic `CREATE` request for each workload the scan collected. Use it to see how webhook matching rules, namespace selectors, object selectors and `matchPolicy` apply to your workloads. It reads the cluster's `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` objects, so it needs list permission on both.
+
+Only `CREATE` is analyzed, for `Pod`, `ReplicationController`, `Deployment`, `StatefulSet`, `DaemonSet`, `ReplicaSet`, `Job` and `CronJob`. `UPDATE`, `DELETE` and `CONNECT` are not analyzed, and the tool has no argument for them. The tool reports no findings and does not change any control result.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `limit` | number | No | Maximum number of workloads whose per-webhook results are returned, 1–1000 (optional, default 100). `webhooks` always summarizes every analyzed workload |
+
+**What the verdicts mean:**
+
+- `Matched`: the synthetic request satisfies the webhook's matching criteria. It does not prove the webhook is called, healthy or available, or that it enforces any policy.
+- `NotMatched`: the synthetic request does not satisfy the webhook's matching criteria. It does not prove the workload is unprotected or bypassed: other webhooks, admission policies and built-in admission plugins are not evaluated.
+- `Indeterminate`: the available information could not decide the match. `reasons` says why (for example `MatchConditions`, `NamespaceLabelsUnknown`). It is neither `Matched` nor `NotMatched`.
+
+**Completeness:**
+
+The scan is scoped to one control, so it may not collect every workload kind. The response never presents that as full coverage.
+
+- `status` is `complete` only when `validating_source`, `mutating_source` and `workloads_complete` are all complete; otherwise it is `incomplete`. A `complete` status does not mean every verdict is definite.
+- `validating_source` and `mutating_source` say whether each kind of configuration could be read (`available`, `complete`, `error`, `error_kind` of `unsupported`, `forbidden` or `other`, and any `decode_errors`). When one is unavailable, no result mentions that kind, which says nothing about whether such webhooks exist. The other kind's results are still returned.
+- `workloads_complete` is `false` when the scan did not list every analyzable workload kind across the whole cluster. A workload missing from `workloads` may exist.
+- `namespace_labels_known` is `false` for a workload whose namespace labels were not collected; a `namespaceSelector` on such a namespace is `Indeterminate`, not evaluated against empty labels.
+- `skipped` counts collected resources that were not analyzed, by kind and reason.
+- `configuration_issues` lists malformed parts of webhook configurations.
+- `truncated` is `true` when `workloads` was cut to `limit`; `total_workloads` is the full count.
+
+If the scan finishes without an analysis (for example the webhook configurations could not be collected at all), the tool returns an `ANALYSIS_UNAVAILABLE` error rather than an empty result. Scan failures use the same error codes as the other scan tools.
+
+**Example Response:**
+```json
+{
+  "status": "incomplete",
+  "complete": false,
+  "operation": "CREATE",
+  "validating_source": {"available": true, "complete": true, "configurations": 1},
+  "mutating_source": {"available": false, "complete": false, "configurations": 0, "error": "not permitted to list admission webhook configurations", "error_kind": "forbidden"},
+  "workloads_complete": false,
+  "configuration_issues": [],
+  "webhooks": [
+    {"type": "Validating", "configuration": "policy-webhook", "webhook": "validate.example.com", "matched": 1, "not_matched": 0, "indeterminate": 0}
+  ],
+  "total_workloads": 1,
+  "returned_workloads": 1,
+  "truncated": false,
+  "workloads": [
+    {
+      "api_version": "apps/v1",
+      "kind": "Deployment",
+      "namespace": "prod",
+      "name": "web",
+      "namespace_labels_known": true,
+      "results": [
+        {"type": "Validating", "configuration": "policy-webhook", "webhook": "validate.example.com", "verdict": "Matched", "reasons": []}
+      ]
+    }
+  ],
+  "skipped": [],
+  "limitations": ["..."]
+}
+```
+
 #### `scan_workload`
 
 Scan a single named Kubernetes workload for misconfigurations and return its failed controls. Prefer this over `scan_controls` or `run_framework_security_scan` once you know which workload you care about: only the rules whose match criteria cover that resource's kind are evaluated, and the queries they need are scoped to the workload's namespace, so the scan is much cheaper and the response much smaller than a namespace-wide one.
@@ -784,6 +849,7 @@ Compare two already-produced Kubescape scan report files (JSON) and return what 
 | `base_report` | string | Yes | Path to the baseline/base Kubescape scan report JSON file |
 | `head_report` | string | Yes | Path to the current/head Kubescape scan report JSON file |
 | `include_unchanged` | boolean | No | Also list the findings that are the same in both reports (default false). `counts` always gives the number of new, resolved, unchanged and incomparable findings |
+| `min_severity` | string | No | Minimum finding severity to include: `Critical`, `High`, `Medium`, `Low` |
 
 **Example use case:** "What changed between these two Kubescape reports?"
 
@@ -1075,11 +1141,42 @@ A missing resource, a missing control or the absence of a finding is never treat
 
 ### Admission Policy Tools
 
-Both tools read only the CEL admission policy library embedded in the Kubescape binary. They make no cluster, file or network access, and neither applies anything to a cluster. Kubescape's ValidatingAdmissionPolicy support is experimental.
+These tools read only the CEL admission policy library embedded in the Kubescape binary. They make no cluster, file or network access, and none applies anything to a cluster. Kubescape's ValidatingAdmissionPolicy support is experimental.
 
 #### `list_admission_policies`
 
 List the ValidatingAdmissionPolicies in the embedded library, with the Kubescape control each one implements (`controlID`), whether it reads parameters (`takesParams`), its `failurePolicy` and the `resources` it matches. It takes no arguments. The output is the same as `kubescape vap list-policies --format json`.
+
+#### `generate_vap`
+
+Generate a `ValidatingAdmissionPolicy` manifest for a control or policy in the embedded library. The tool runs the same validation as `kubescape vap generate-policy` and returns the YAML for you to review; it does **not** apply it to a cluster.
+
+Only controls that already have a CEL/VAP implementation in the embedded library are supported. Requesting a control or policy without a CEL implementation returns an error stating no CEL equivalent exists yet.
+
+**Arguments:**
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `control_id` | string | Kubescape control ID whose policy to generate, in any casing (e.g. `C-0016`). Exactly one of `control_id` or `policy_name` is required |
+| `policy_name` | string | Name of the ValidatingAdmissionPolicy to generate (see `list_admission_policies`). Exactly one of `control_id` or `policy_name` is required |
+
+**Response:**
+
+```json
+{
+  "policy_name": "kubescape-c-0016-allow-privilege-escalation",
+  "control_id": "C-0016",
+  "manifest": "apiVersion: admissionregistration.k8s.io/v1\nkind: ValidatingAdmissionPolicy\n...",
+  "takes_params": false
+}
+```
+
+- `policy_name` is the resolved ValidatingAdmissionPolicy name.
+- `control_id` is the associated Kubescape control ID (if applicable).
+- `manifest` is the generated ValidatingAdmissionPolicy YAML.
+- `takes_params` indicates whether the policy declares a `spec.paramKind`.
+
+**Errors:** `INVALID_ARGUMENT` if neither or both arguments are specified, or if the requested control/policy has no CEL equivalent yet.
 
 #### `create_admission_policy_binding`
 

@@ -2,7 +2,9 @@ package cautils
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/hashicorp/hcl/v2"
@@ -98,46 +100,54 @@ var typedResourceGVK = map[string]struct{ apiVersion, kind string }{
 // (block "container" -> field "containers"). Anything not listed here just
 // gets its singular name camelCased.
 var pluralOverrides = map[string]string{
-	"container":               "containers",
-	"init_container":          "initContainers",
-	"volume":                  "volumes",
-	"volume_mount":            "volumeMounts",
-	"env_from":                "envFrom",
-	"port":                    "ports",
-	"toleration":              "tolerations",
-	"host_alias":              "hostAliases",
-	"host_aliases":            "hostAliases",
-	"rule":                    "rules",
-	"path":                    "paths",
-	"subject":                 "subjects",
-	"image_pull_secret":       "imagePullSecrets",
-	"image_pull_secrets":      "imagePullSecrets",
-	"match_expressions":       "matchExpressions",
-	"match_expression":        "matchExpressions",
-	"match_fields":            "matchFields",
-	"match_field":             "matchFields",
-	"volume_claim_template":   "volumeClaimTemplates",
-	"http_header":             "httpHeaders",
-	"sysctl":                  "sysctls",
-	"limit":                   "limits",
-	"metric":                  "metrics",
-	"policy":                  "policies",
-	"node_selector_term":      "nodeSelectorTerms",
-	"node_selector_terms":     "nodeSelectorTerms",
-	"webhook":                 "webhooks",
-	"match_condition":         "matchConditions",
-	"match_conditions":        "matchConditions",
-	"match_label_expression":  "matchLabelExpressions",
-	"match_label_expressions": "matchLabelExpressions",
-	"allowed_topology":        "allowedTopologies",
-	"allowed_topologies":      "allowedTopologies",
-	"token_request":           "tokenRequests",
-	"token_requests":          "tokenRequests",
-	"subset":                  "subsets",
-	"endpoint":                "endpoints",
-	"address":                 "addresses",
-	"not_ready_address":       "notReadyAddresses",
-	"condition":               "conditions",
+	"container":                  "containers",
+	"init_container":             "initContainers",
+	"volume":                     "volumes",
+	"volume_mount":               "volumeMounts",
+	"volume_device":              "volumeDevices",
+	"volume_devices":             "volumeDevices",
+	"env_from":                   "envFrom",
+	"port":                       "ports",
+	"toleration":                 "tolerations",
+	"host_alias":                 "hostAliases",
+	"host_aliases":               "hostAliases",
+	"rule":                       "rules",
+	"path":                       "paths",
+	"subject":                    "subjects",
+	"image_pull_secret":          "imagePullSecrets",
+	"image_pull_secrets":         "imagePullSecrets",
+	"match_expressions":          "matchExpressions",
+	"match_expression":           "matchExpressions",
+	"match_fields":               "matchFields",
+	"match_field":                "matchFields",
+	"volume_claim_template":      "volumeClaimTemplates",
+	"http_header":                "httpHeaders",
+	"sysctl":                     "sysctls",
+	"limit":                      "limits",
+	"metric":                     "metrics",
+	"policy":                     "policies",
+	"node_selector_term":         "nodeSelectorTerms",
+	"node_selector_terms":        "nodeSelectorTerms",
+	"webhook":                    "webhooks",
+	"match_condition":            "matchConditions",
+	"match_conditions":           "matchConditions",
+	"match_label_expression":     "matchLabelExpressions",
+	"match_label_expressions":    "matchLabelExpressions",
+	"allowed_topology":           "allowedTopologies",
+	"allowed_topologies":         "allowedTopologies",
+	"token_request":              "tokenRequests",
+	"token_requests":             "tokenRequests",
+	"subset":                     "subsets",
+	"endpoint":                   "endpoints",
+	"address":                    "addresses",
+	"not_ready_address":          "notReadyAddresses",
+	"condition":                  "conditions",
+	"readiness_gate":             "readinessGates",
+	"topology_spread_constraint": "topologySpreadConstraints",
+	"option":                     "options",
+	"options":                    "options",
+	"on_pod_condition":           "onPodConditions",
+	"on_pod_conditions":          "onPodConditions",
 }
 
 // repeatableBlocks lists HCL block labels that always encode as a JSON array,
@@ -145,6 +155,7 @@ var pluralOverrides = map[string]string{
 // but the K8s field underneath (e.g. spec.containers) is always a list.
 var repeatableBlocks = map[string]bool{
 	"container": true, "init_container": true, "volume": true, "volume_mount": true,
+	"volume_device": true, "volume_devices": true,
 	"env": true, "env_from": true, "port": true, "ports": true, "toleration": true,
 	"host_alias": true, "host_aliases": true, "rule": true, "subject": true,
 	"image_pull_secret": true, "image_pull_secrets": true,
@@ -161,6 +172,12 @@ var repeatableBlocks = map[string]bool{
 	"token_request": true, "token_requests": true,
 	"subset": true, "endpoint": true,
 	"address": true, "not_ready_address": true,
+	"readiness_gate": true, "topology_spread_constraint": true,
+	"items": true, "sources": true,
+	"preferred_during_scheduling_ignored_during_execution": true,
+	"cluster_role_selectors":                               true,
+	"option":                                               true, "options": true,
+	"on_pod_condition": true, "on_pod_conditions": true,
 }
 
 // resourceMetaAttributes are Terraform meta-argument attributes valid on any
@@ -183,6 +200,30 @@ var resourceMetaBlocks = map[string]bool{
 	"lifecycle":   true,
 	"provisioner": true,
 	"connection":  true,
+}
+
+// providerControlAttributes are top-level attributes of the Kubernetes
+// provider's resources that tell the provider how to apply the object, such
+// as whether to wait for a rollout. They are not part of the Kubernetes object
+// the provider creates, so like the meta-arguments they are stripped at the
+// resource's top level only.
+var providerControlAttributes = map[string]bool{
+	"wait_for_rollout":                 true, // deployments, stateful sets, daemon sets
+	"wait_for_load_balancer":           true, // services, ingresses
+	"wait_for_completion":              true, // jobs
+	"wait_for_default_service_account": true, // namespaces
+	"wait_for_service_account_token":   true, // secrets
+	"wait_until_bound":                 true, // persistent volume claims
+	"auto_approve":                     true, // certificate signing requests
+	"target_state":                     true, // pods
+	"data_wo_revision":                 true, // secrets
+	"binary_data_wo_revision":          true, // secrets
+}
+
+// providerControlBlocks are the provider's top-level control blocks, stripped
+// for the same reason.
+var providerControlBlocks = map[string]bool{
+	"timeouts": true,
 }
 
 var fieldInitialisms = map[string]string{
@@ -229,6 +270,8 @@ func attributeNameFor(name string) string {
 		return "diskURI"
 	case "target_ww_ns":
 		return "targetWWNs"
+	case "timezone":
+		return "timeZone"
 	}
 	if name == "storage_provisioner" {
 		return "provisioner"
@@ -250,6 +293,19 @@ var rbdAttributeNames = map[string]string{
 // attributeKeyFor is attributeNameFor for an attribute of the block at path,
 // for the attributes whose Kubernetes name depends on the block they are in.
 func attributeKeyFor(path, name string) string {
+	if isSecretResource(path) {
+		// The provider sends data and the write-only data_wo as the Secret's
+		// stringData, and binary_data and binary_data_wo, already base64, as
+		// its data. A Secret has no binaryData field. The write-only values
+		// are kept even without their *_revision argument, which only tells
+		// the provider when to send them; they are masked like the rest.
+		switch name {
+		case "data", "data_wo":
+			return "stringData"
+		case "binary_data", "binary_data_wo":
+			return "data"
+		}
+	}
 	if strings.HasSuffix(path, ".rbd") {
 		if key, ok := rbdAttributeNames[name]; ok {
 			return key
@@ -354,6 +410,25 @@ func isConvertiblePortField(path, name string) bool {
 	return isNetworkPolicyPortField(path, name) || isLegacyIngressBackendPortField(path, name) || isIngressBackendServicePortNumberField(path, name)
 }
 
+// isSecretResource reports whether path is the top level of a Secret
+// resource. The provider takes its data attribute as plain text and sends it
+// as the Secret's stringData; data in Kubernetes holds base64 values.
+func isSecretResource(path string) bool {
+	return (strings.HasPrefix(path, "kubernetes_secret.") || strings.HasPrefix(path, "kubernetes_secret_v1.")) &&
+		strings.Count(path, ".") == 1
+}
+
+// isDaemonSetStrategyBlock reports whether blockType is the strategy block of
+// a DaemonSet spec. The provider calls it strategy, but builds the DaemonSet's
+// updateStrategy from it.
+func isDaemonSetStrategyBlock(path, blockType string) bool {
+	if blockType != "strategy" || !strings.HasSuffix(path, ".spec") || strings.Count(path, ".") != 2 {
+		return false
+	}
+	return strings.HasPrefix(path, "kubernetes_daemonset.") || strings.HasPrefix(path, "kubernetes_daemon_set.") ||
+		strings.HasPrefix(path, "kubernetes_daemon_set_v1.")
+}
+
 func isServiceAccountSecretBlock(path, blockType string) bool {
 	if blockType != "secret" {
 		return false
@@ -387,11 +462,34 @@ func usesHPAV2beta2(obj map[string]interface{}) bool {
 	return hasMetrics || hasBehavior
 }
 
+// isPodAffinityRequiredBlock reports whether blockType is the
+// required_during_scheduling_ignored_during_execution block of a pod affinity
+// or anti-affinity, which is a list of terms. The node affinity block of the
+// same name is a single NodeSelector.
+func isPodAffinityRequiredBlock(path, blockType string) bool {
+	if blockType != "required_during_scheduling_ignored_during_execution" {
+		return false
+	}
+	return strings.HasSuffix(path, ".pod_affinity") || strings.HasSuffix(path, ".pod_anti_affinity")
+}
+
 func isNestedHPAMetricBlock(path, blockType string) bool {
 	if blockType != "metric" {
 		return false
 	}
 	return strings.HasSuffix(path, ".external") || strings.HasSuffix(path, ".pods") || strings.HasSuffix(path, ".object")
+}
+
+// isEphemeralVolumeClaimTemplateBlock reports whether blockType is the
+// volume_claim_template of an ephemeral volume source. The provider reuses the
+// name from StatefulSet, but in an EphemeralVolumeSource it is a single object
+// named volumeClaimTemplate, not the list of volumeClaimTemplates a StatefulSet
+// takes.
+func isEphemeralVolumeClaimTemplateBlock(path, blockType string) bool {
+	if blockType != "volume_claim_template" {
+		return false
+	}
+	return strings.HasSuffix(path, ".ephemeral")
 }
 
 // isServiceTargetPortField reports whether name is a Service port's
@@ -434,12 +532,38 @@ func isSecurityContextIDField(path, name string) bool {
 	return false
 }
 
+// isJobTTLField reports whether name is a Job spec's ttl_seconds_after_finished,
+// in a Job or in a CronJob's job template. The provider declares it as a
+// string and parses it with strconv.Atoi.
+func isJobTTLField(path, name string) bool {
+	if name != "ttl_seconds_after_finished" || !strings.HasSuffix(path, ".spec") {
+		return false
+	}
+	return strings.HasPrefix(path, "kubernetes_job") || strings.HasPrefix(path, "kubernetes_cron_job")
+}
+
 // isStringTypedNumberField covers the provider's string-typed fields that hold
 // a number: int-or-string ports, where a value made of digits only is a port
 // number and anything else a port name, as intstr.Parse reads it, and the
 // security context IDs.
 func isStringTypedNumberField(path, name string) bool {
-	return isServiceTargetPortField(path, name) || isHandlerPortField(path, name) || isSecurityContextIDField(path, name)
+	return isServiceTargetPortField(path, name) || isHandlerPortField(path, name) || isSecurityContextIDField(path, name) ||
+		isJobTTLField(path, name)
+}
+
+// isVolumeFileModeField reports whether name is the default_mode of a secret,
+// config_map, downward_api or projected volume source, or the mode of one of
+// their items. The provider declares these as strings holding an octal number,
+// such as "0644", and parses them with strconv.ParseInt(v, 8, 32).
+func isVolumeFileModeField(path, name string) bool {
+	switch name {
+	case "default_mode":
+		return strings.HasSuffix(path, ".secret") || strings.HasSuffix(path, ".config_map") ||
+			strings.HasSuffix(path, ".downward_api") || strings.HasSuffix(path, ".projected")
+	case "mode":
+		return strings.HasSuffix(path, ".items")
+	}
+	return false
 }
 
 // isPDBIntOrStringField reports whether name is min_available or
@@ -456,6 +580,56 @@ func isPDBIntOrStringField(path, name string) bool {
 	return strings.Contains(path, "kubernetes_pod_disruption_budget")
 }
 
+// providerBoolFields are the attributes the provider declares as bools, taken
+// from its schema for the resources in typedResourceGVK. Each of these names
+// is a bool wherever it appears, so the name alone is enough.
+var providerBoolFields = map[string]bool{
+	"allocate_load_balancer_node_ports": true,
+	"allow_privilege_escalation":        true,
+	"allow_volume_expansion":            true,
+	"attach_required":                   true,
+	"auto_approve":                      true,
+	"automount_service_account_token":   true,
+	"enable_service_links":              true,
+	"global_default":                    true,
+	"host_ipc":                          true,
+	"host_network":                      true,
+	"host_pid":                          true,
+	"host_process":                      true,
+	"immutable":                         true,
+	"manual_selector":                   true,
+	"optional":                          true,
+	"paused":                            true,
+	"pod_info_on_mount":                 true,
+	"privileged":                        true,
+	"publish_not_ready_addresses":       true,
+	"read_only":                         true,
+	"read_only_root_filesystem":         true,
+	"ready":                             true,
+	"run_as_non_root":                   true,
+	"serving":                           true,
+	"share_process_namespace":           true,
+	"stdin":                             true,
+	"stdin_once":                        true,
+	"suspend":                           true,
+	"terminating":                       true,
+	"tty":                               true,
+}
+
+// terraformBoolString converts a string set on a bool attribute the way
+// Terraform does before the provider sees it: only "true", "false", "1" and
+// "0" convert, anything else is a Terraform error. strconv.ParseBool is not
+// used because it also takes "TRUE" and "True", which Terraform rejects.
+func terraformBoolString(s string) (bool, bool) {
+	switch s {
+	case "true", "1":
+		return true, true
+	case "false", "0":
+		return false, true
+	}
+	return false, false
+}
+
 func attributeValueFor(path, name string, val interface{}) interface{} {
 	// The provider keeps the security context IDs in strings so that "" can
 	// leave them unset: it sets runAsUser, runAsGroup and fsGroup only from a
@@ -463,8 +637,18 @@ func attributeValueFor(path, name string, val interface{}) interface{} {
 	if s, ok := val.(string); ok && s == "" && isSecurityContextIDField(path, name) {
 		return nil
 	}
+	if s, ok := val.(string); ok && isVolumeFileModeField(path, name) {
+		if mode, err := strconv.ParseInt(s, 8, 32); err == nil {
+			return json.Number(strconv.FormatInt(mode, 10))
+		}
+	}
 	if s, ok := val.(string); ok && (isConvertiblePortField(path, name) || isStringTypedNumberField(path, name) || isPDBIntOrStringField(path, name) || isEndpointSlicePortField(path, name)) && isDigitOnly(s) {
 		return json.Number(canonicalizeNumericString(s))
+	}
+	if s, ok := val.(string); ok && providerBoolFields[name] {
+		if b, ok := terraformBoolString(s); ok {
+			return b
+		}
 	}
 	return val
 }
@@ -488,7 +672,7 @@ func (c *terraformBodyConverter) bodyToMap(body *hclsyntax.Body, evalCtx *hcl.Ev
 		if c.exhausted {
 			break
 		}
-		if resource && resourceMetaAttributes[name] {
+		if resource && (resourceMetaAttributes[name] || providerControlAttributes[name]) {
 			continue
 		}
 		val, diags := attr.Expr.Value(evalCtx)
@@ -534,6 +718,11 @@ func (c *terraformBodyConverter) bodyToMap(body *hclsyntax.Body, evalCtx *hcl.Ev
 			}
 			continue
 		}
+		// A provider control block is an ordinary block of the resource, so a
+		// dynamic block may generate it.
+		if resource && providerControlBlocks[b.Type] {
+			continue
+		}
 		if _, seen := grouped[b.Type]; !seen {
 			order = append(order, b.Type)
 		}
@@ -559,9 +748,19 @@ func (c *terraformBodyConverter) bodyToMap(body *hclsyntax.Body, evalCtx *hcl.Ev
 			field = "secrets"
 			isRepeatable = true
 		}
+		if isDaemonSetStrategyBlock(path, blockType) {
+			field = "updateStrategy"
+		}
 		if isNestedHPAMetricBlock(path, blockType) {
 			field = "metric"
 			isRepeatable = false
+		}
+		if isEphemeralVolumeClaimTemplateBlock(path, blockType) {
+			field = "volumeClaimTemplate"
+			isRepeatable = false
+		}
+		if isPodAffinityRequiredBlock(path, blockType) {
+			isRepeatable = true
 		}
 
 		if isRepeatable {
@@ -603,9 +802,20 @@ func hclResourceBodyToMap(body *hclsyntax.Body, evalCtx *hcl.EvalContext, errs *
 // converts each into a K8s manifest map. Resource types with no entry in the
 // table are left alone (not guessed at); a metadata.name is defaulted from
 // the Terraform resource label when the block doesn't set one explicitly. A
-// resource with count or for_each becomes one manifest per known instance; a
-// count or for_each that can't be resolved is an error.
+// resource with count or for_each becomes one manifest per known instance.
+//
+// An attribute that can't be resolved is left unset rather than guessed at.
+// Its errors are returned as *terraformResourceError, so the loader can leave
+// out only that resource and still scan the rest of the configuration.
 func extractTypedResources(body hcl.Body, evalCtx *hcl.EvalContext, references ...terraformReferenceChecker) ([]map[string]interface{}, []error) {
+	manifests, errs := extractTypedResourceManifests(body, evalCtx, references...)
+	return terraformManifestObjects(manifests), errs
+}
+
+// extractTypedResourceManifests is extractTypedResources, keeping the source
+// range of the resource block each manifest was converted from and marking
+// the manifests of a resource with errors as incomplete.
+func extractTypedResourceManifests(body hcl.Body, evalCtx *hcl.EvalContext, references ...terraformReferenceChecker) ([]terraformManifest, []error) {
 	synBody, ok := body.(*hclsyntax.Body)
 	if !ok {
 		return nil, nil
@@ -615,7 +825,7 @@ func extractTypedResources(body hcl.Body, evalCtx *hcl.EvalContext, references .
 		reference = references[0]
 	}
 	var errs []error
-	var manifests []map[string]interface{}
+	var manifests []terraformManifest
 
 	for _, block := range synBody.Blocks {
 		if block.Type != "resource" || len(block.Labels) < 2 {
@@ -629,19 +839,93 @@ func extractTypedResources(body hcl.Body, evalCtx *hcl.EvalContext, references .
 		path := block.Labels[0] + "." + block.Labels[1]
 		instances, err := terraformResourceInstances(
 			syntaxAttribute(block.Body, "count"), syntaxAttribute(block.Body, "for_each"),
-			evalCtx, reference, path, block.Range().End.Byte-block.Range().Start.Byte)
+			evalCtx, reference, path, reference.sourceSize(block.Body, block.Range().End.Byte-block.Range().Start.Byte))
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, &terraformResourceError{resource: path, err: err})
 			continue
 		}
 		// All instances of the resource share one converter, so the values and
 		// dynamic blocks they generate are bounded together, not per instance.
-		converter := terraformBodyConverter{errs: &errs, remaining: maxTerraformLocalSize, references: reference}
+		var resourceErrs []error
+		converter := terraformBodyConverter{errs: &resourceErrs, remaining: maxTerraformLocalSize, references: reference}
+		var converted []terraformManifest
 		for _, instanceCtx := range instances {
-			manifests = append(manifests, typedResourceManifest(&converter, block, gvk.apiVersion, gvk.kind, instanceCtx, path))
+			converted = append(converted, terraformManifest{
+				object: typedResourceManifest(&converter, block, gvk.apiVersion, gvk.kind, instanceCtx, path),
+				source: block.DefRange(),
+			})
 		}
+		for _, err := range resourceErrs {
+			errs = append(errs, &terraformResourceError{resource: path, err: err})
+		}
+		for i := range converted {
+			converted[i].incomplete = len(resourceErrs) > 0
+		}
+		manifests = append(manifests, converted...)
 	}
 	return manifests, errs
+}
+
+// terraformResourceError is an error converting one resource, such as an
+// attribute that depends on another resource, a data source or a variable
+// without a value. Only that resource is left out of the scan.
+type terraformResourceError struct {
+	// resource is the resource's address, such as kubernetes_pod_v1.web.
+	resource string
+	err      error
+}
+
+func (e *terraformResourceError) Error() string {
+	return e.err.Error()
+}
+
+func (e *terraformResourceError) Unwrap() error {
+	return e.err
+}
+
+// onlyTerraformResourceErrors returns the resources errs left out, in order
+// and without repeats, when every error in errs is a *terraformResourceError,
+// so the rest of the configuration can still be scanned. ok is false when errs
+// is empty or holds any other error.
+func onlyTerraformResourceErrors(errs []error) (resources []string, ok bool) {
+	resources, _, others := splitTerraformResourceErrors(errs)
+	if len(errs) == 0 || len(others) > 0 {
+		return nil, false
+	}
+	return resources, true
+}
+
+// splitTerraformResourceErrors splits errs into the resources that were left
+// out, in order and without repeats, with the *terraformResourceError values
+// that name them, and every other error.
+func splitTerraformResourceErrors(errs []error) (resources []string, resourceErrs, others []error) {
+	seen := map[string]bool{}
+	for _, err := range errs {
+		var resourceErr *terraformResourceError
+		if !errors.As(err, &resourceErr) {
+			others = append(others, err)
+			continue
+		}
+		resourceErrs = append(resourceErrs, err)
+		if !seen[resourceErr.resource] {
+			seen[resourceErr.resource] = true
+			resources = append(resources, resourceErr.resource)
+		}
+	}
+	return resources, resourceErrs, others
+}
+
+// terraformUnresolvedResourcesSkip records that some resources of the
+// Terraform configuration in dir were left out. Like the other Terraform
+// skips, its reason carries neither resource labels nor file names, which
+// --hide can't anonymize in free text; the resources are listed in Resources,
+// which it does, and the scan logs name them with the reasons.
+func terraformUnresolvedResourcesSkip(dir string, resources []string) SkippedManifest {
+	return SkippedManifest{
+		Path:      dir,
+		Reason:    fmt.Sprintf("%d Terraform resource(s) not scanned because they use values that can't be resolved, such as other resources, data sources or variables without a value; see scan logs for details", len(resources)),
+		Resources: resources,
+	}
 }
 
 // syntaxAttribute returns the named attribute of body, or nil when it isn't set.
@@ -827,6 +1111,19 @@ type terraformReferenceChecker struct {
 	proofVariables      map[hcl.Expression][]hcl.Traversal
 	referenceResults    map[terraformReferenceContext]terraformReferenceResult
 	forItems            map[terraformReferenceContext]terraformForItems
+	// sourceSizes holds the source size of resource bodies merged from
+	// override files, whose own source ranges cover only the base block.
+	sourceSizes map[*hclsyntax.Body]int
+}
+
+// sourceSize is the source size in bytes of a resource block with the given
+// body: span, the size of its source range, unless the body was merged from
+// override files.
+func (c *terraformReferenceChecker) sourceSize(body *hclsyntax.Body, span int) int {
+	if size, ok := c.sourceSizes[body]; ok {
+		return size
+	}
+	return span
 }
 
 type terraformReferenceResult struct {

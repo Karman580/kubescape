@@ -19,6 +19,7 @@ import (
 	"github.com/kubescape/kubescape/v4/core/pkg/pathcontainment"
 	"github.com/kubescape/opa-utils/objectsenvelopes/localworkload"
 	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/convert"
 )
 
 const (
@@ -123,6 +124,9 @@ func IsTerraformFile(path string) bool {
 type TerraformDirectory struct {
 	path         string
 	workspaceDir string
+	// sourceLocations holds the resource block location of each workload of
+	// the last GetWorkloads call, by workload path.
+	sourceLocations map[string]SourceLocation
 }
 
 func NewTerraformDirectory(path string, workspaceOpt ...string) *TerraformDirectory {
@@ -138,6 +142,7 @@ func NewTerraformDirectory(path string, workspaceOpt ...string) *TerraformDirect
 // same-module default or an auto-loaded tfvars file are evaluated — deliberately
 // not a full Terraform evaluator (see LoadResourcesFromTerraform doc).
 func (td *TerraformDirectory) GetWorkloads(path string) (map[string][]workloadinterface.IMetadata, []error) {
+	td.sourceLocations = nil
 	path = filepath.Clean(path)
 	entries, err := os.ReadDir(path)
 	if err != nil {
@@ -146,9 +151,11 @@ func (td *TerraformDirectory) GetWorkloads(path string) (map[string][]workloadin
 
 	parser := hclparse.NewParser()
 	var errs []error
-	varDefaults := map[string]cty.Value{}
-	declared := map[string]terraformVariable{}
-	var files []*hcl.File
+	// Override files (override.tf, *_override.tf) are merged into the primary
+	// files rather than read as configuration of their own, as in Terraform.
+	// os.ReadDir lists entries sorted by name, the order Terraform applies
+	// override files in.
+	var files, overrideFiles []*hcl.File
 	var parsedPaths []string
 	for _, entry := range entries {
 		if !IsTerraformFile(entry.Name()) {
@@ -170,30 +177,51 @@ func (td *TerraformDirectory) GetWorkloads(path string) (map[string][]workloadin
 			errs = append(errs, fmt.Errorf("parsing %s: %w", f, diags))
 			continue
 		}
+		if isTerraformOverrideFile(f) {
+			overrideFiles = append(overrideFiles, file)
+			continue
+		}
 		files = append(files, file)
 		parsedPaths = append(parsedPaths, f)
-		collectVariableDefaults(file.Body, varDefaults, declared)
 	}
 
+	merged, overrideErrs := applyTerraformOverrides(files, overrideFiles)
+	errs = append(errs, overrideErrs...)
+	files = merged.files
+
+	varDefaults := map[string]cty.Value{}
+	declared := map[string]terraformVariable{}
+	for _, file := range files {
+		collectVariableDefaults(file.Body, varDefaults, declared)
+	}
+	applyTerraformVariableOverrides(merged.variables, varDefaults, declared)
 	if len(files) > 0 {
 		errs = append(errs, applyTerraformVarFiles(parser, path, td.workspaceDir, declared, varDefaults)...)
 	}
 	locals, localExpressions := resolveLocals(files, varDefaults)
 	evalCtx := newTerraformEvalContext(varDefaults, locals)
-	references := terraformReferenceChecker{localExpressions: localExpressions, moduleCtx: evalCtx, declaredVariables: declared}
+	references := terraformReferenceChecker{localExpressions: localExpressions, moduleCtx: evalCtx, declaredVariables: declared, sourceSizes: merged.sourceSizes}
 
 	workloads := map[string][]workloadinterface.IMetadata{}
 	for i, file := range files {
-		manifests, fileErrs := extractKubernetesManifests(file.Body, evalCtx, references)
+		manifests, fileErrs := extractKubernetesManifestResources(file.Body, evalCtx, references)
 		errs = append(errs, fileErrs...)
 
-		typedManifests, typedErrs := extractTypedResources(file.Body, evalCtx, references)
+		typedManifests, typedErrs := extractTypedResourceManifests(file.Body, evalCtx, references)
 		errs = append(errs, typedErrs...)
-		manifests = append(manifests, typedManifests...)
+		for _, manifest := range typedManifests {
+			// A resource with unresolved values is reported through its
+			// *terraformResourceError instead of being scanned incomplete.
+			if !manifest.incomplete {
+				manifests = append(manifests, manifest)
+			}
+		}
 
 		src := parsedPaths[i]
-		for j, m := range manifests {
-			data, err := json.Marshal(m)
+		for j, manifest := range manifests {
+			workloadPath := terraformWorkloadPath(src, j)
+			td.recordSourceLocation(workloadPath, manifest.source)
+			data, err := json.Marshal(manifest.object)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("%s: manifest %d: %w", src, j, err))
 				continue
@@ -208,7 +236,7 @@ func (td *TerraformDirectory) GetWorkloads(path string) (map[string][]workloadin
 					continue
 				}
 				lw := localworkload.NewLocalWorkload(w.GetObject())
-				lw.SetPath(fmt.Sprintf("%s:%d", src, j))
+				lw.SetPath(workloadPath)
 				workloads[src] = append(workloads[src], lw)
 			}
 		}
@@ -238,8 +266,8 @@ func collectVariableDefaults(body hcl.Body, defaults map[string]cty.Value, decla
 		attrContent, _, _ := block.Body.PartialContent(attrSchema)
 		variable := newTerraformVariable(attrContent.Attributes["type"])
 		if attr, ok := attrContent.Attributes["nullable"]; ok {
-			if val, diags := attr.Expr.Value(nil); !diags.HasErrors() && val.Type() == cty.Bool && val.IsKnown() && !val.IsNull() {
-				variable.nonNullable = val.False()
+			if nonNullable, ok := terraformVariableNonNullable(attr); ok {
+				variable.nonNullable = nonNullable
 			}
 		}
 		if attr, ok := attrContent.Attributes["default"]; ok {
@@ -254,13 +282,37 @@ func collectVariableDefaults(body hcl.Body, defaults map[string]cty.Value, decla
 	}
 }
 
+// terraformVariableNonNullable reads a variable's nullable argument, reporting
+// whether it is set to false. As in Terraform, a value that converts to bool,
+// such as "false", is accepted; ok is false when the value isn't a known bool
+// after conversion.
+func terraformVariableNonNullable(attr *hcl.Attribute) (nonNullable, ok bool) {
+	val, diags := attr.Expr.Value(nil)
+	if diags.HasErrors() || !val.IsWhollyKnown() || val.IsNull() {
+		return false, false
+	}
+	val, err := convert.Convert(val, cty.Bool)
+	if err != nil || !val.IsKnown() || val.IsNull() {
+		return false, false
+	}
+	return val.False(), true
+}
+
 // extractKubernetesManifests finds resource "kubernetes_manifest" "x" { manifest = {...} }
 // blocks and returns each manifest as a plain Go map, ready for json.Marshal.
-// A resource with count or for_each gives one manifest per known instance. As
-// with an unresolved manifest, a count or for_each that can't be resolved
-// skips only that resource, with a warning. references checks count and
-// for_each for unresolved references, including ones hidden in locals.
+// A resource with count or for_each gives one manifest per known instance. A
+// manifest, count or for_each that can't be resolved leaves out only that
+// resource, and is returned as a *terraformResourceError so the loader reports
+// it, like a typed resource. references checks count and for_each for
+// unresolved references, including ones hidden in locals.
 func extractKubernetesManifests(body hcl.Body, evalCtx *hcl.EvalContext, references ...terraformReferenceChecker) ([]map[string]interface{}, []error) {
+	manifests, errs := extractKubernetesManifestResources(body, evalCtx, references...)
+	return terraformManifestObjects(manifests), errs
+}
+
+// extractKubernetesManifestResources is extractKubernetesManifests, keeping
+// the source range of the kubernetes_manifest block each manifest came from.
+func extractKubernetesManifestResources(body hcl.Body, evalCtx *hcl.EvalContext, references ...terraformReferenceChecker) ([]terraformManifest, []error) {
 	var reference terraformReferenceChecker
 	if len(references) > 0 {
 		reference = references[0]
@@ -273,7 +325,7 @@ func extractKubernetesManifests(body hcl.Body, evalCtx *hcl.EvalContext, referen
 	}
 	content, _, _ := body.PartialContent(schema)
 
-	var manifests []map[string]interface{}
+	var manifests []terraformManifest
 	for _, block := range content.Blocks {
 		if len(block.Labels) < 2 || block.Labels[0] != "kubernetes_manifest" {
 			continue
@@ -288,20 +340,25 @@ func extractKubernetesManifests(body hcl.Body, evalCtx *hcl.EvalContext, referen
 		}
 		var sourceSize int
 		if synBody, ok := block.Body.(*hclsyntax.Body); ok {
-			sourceSize = synBody.SrcRange.End.Byte - synBody.SrcRange.Start.Byte
+			sourceSize = reference.sourceSize(synBody, synBody.SrcRange.End.Byte-synBody.SrcRange.Start.Byte)
 		}
+		path := "kubernetes_manifest." + block.Labels[1]
 		instances, err := terraformResourceInstances(attrContent.Attributes["count"], attrContent.Attributes["for_each"],
-			evalCtx, reference, "kubernetes_manifest."+block.Labels[1], sourceSize)
+			evalCtx, reference, path, sourceSize)
 		if err != nil {
-			logger.L().Warning("skipping kubernetes_manifest with unresolved count or for_each",
-				helpers.String("resource", block.Labels[1]), helpers.Error(err))
+			errs = append(errs, &terraformResourceError{resource: path, err: err})
 			continue
 		}
+		// Like a typed resource, the resource is left out when any of its
+		// instances can't be resolved, so it is never reported as skipped
+		// while part of it is scanned.
+		var converted []terraformManifest
+		unresolved := false
 		for _, instanceCtx := range instances {
 			val, diags := attr.Expr.Value(instanceCtx)
 			if diags.HasErrors() {
-				logger.L().Warning("skipping unresolved kubernetes_manifest reference",
-					helpers.String("resource", block.Labels[1]), helpers.Error(diags))
+				errs = append(errs, &terraformResourceError{resource: path, err: diags})
+				unresolved = true
 				continue
 			}
 			goVal := ctyToGo(val)
@@ -310,7 +367,10 @@ func extractKubernetesManifests(body hcl.Body, evalCtx *hcl.EvalContext, referen
 				errs = append(errs, fmt.Errorf("resource %q: manifest is not an object", block.Labels[1]))
 				continue
 			}
-			manifests = append(manifests, m)
+			converted = append(converted, terraformManifest{object: m, source: block.DefRange})
+		}
+		if !unresolved {
+			manifests = append(manifests, converted...)
 		}
 	}
 	return manifests, errs

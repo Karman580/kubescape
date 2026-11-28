@@ -165,8 +165,8 @@ func TestScanFormatCompletion(t *testing.T) {
 		{
 			name:    "image scan suggests only supported formats",
 			args:    []string{"scan", "image", "--format", "g"},
-			want:    []string{"gitlab-container-scanning"},
-			exclude: []string{"github-actions"},
+			want:    []string{"gitlab-container-scanning", "github-actions"},
+			exclude: []string{"gitlab-codequality"},
 		},
 		{
 			name: "image scan suggests JSON and JUnit",
@@ -208,11 +208,11 @@ func TestScanFormatCompletionByCommand(t *testing.T) {
 			wantPresent: true,
 		},
 		{
-			name: "image scan excludes github-actions",
+			name: "image scan excludes gitlab-codequality",
 			args: []string{
 				"__complete", "scan", "image", "--format", "g",
 			},
-			candidate:   "github-actions",
+			candidate:   "gitlab-codequality",
 			wantPresent: false,
 		},
 		{
@@ -264,5 +264,47 @@ func TestCompleteCommaSeparatedLeadingComma(t *testing.T) {
 
 	if len(results) != 1 || results[0] != ",json" {
 		t.Fatalf("expected [,json], got %v", results)
+	}
+}
+
+func TestScanCommandWholeClusterPolicyCompletion(t *testing.T) {
+	tests := []struct {
+		name     string
+		prefix   string
+		expected []string
+	}{
+		{
+			name:     "empty prefix lists all policies",
+			prefix:   "",
+			expected: []string{"projected", "fallback", "skip", "verify"},
+		},
+		{
+			name:     "lowercase prefix",
+			prefix:   "p",
+			expected: []string{"projected"},
+		},
+		{
+			name:     "uppercase prefix preserves case",
+			prefix:   "V",
+			expected: []string{"Verify"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := &cobra.Command{Use: "kubescape"}
+			root.AddCommand(GetScanCommand(nil))
+
+			var output bytes.Buffer
+			root.SetOut(&output)
+			root.SetErr(io.Discard)
+			root.SetArgs([]string{"__complete", "scan", "--whole-cluster-policy", tt.prefix})
+
+			require.NoError(t, root.Execute())
+			lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+			for _, want := range tt.expected {
+				assert.Contains(t, lines, want)
+			}
+		})
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -109,18 +110,38 @@ func TestScanResultRetentionLimits(t *testing.T) {
 	_, err = store.page("alice", id, 0, 100, now)
 	require.ErrorIs(t, err, errScanResultsUnavailable)
 
+	before, err := snapshotMetadataSize(doc)
+	require.NoError(t, err)
+	registered := doc
+	registered.ScanID = strings.Repeat("0", 64)
+	expiry := now.Add(scanResultsTTL)
+	registered.ExpiresAt = &expiry
+	after, err := snapshotMetadataSize(registered)
+	require.NoError(t, err)
+	baseSize := scanResultsMaxBytes - (after - before)
+
 	var byteLimited scanResultStore
-	_, err = byteLimited.firstPage("alice", doc, scanResultsMaxBytes, now)
-	require.NoError(t, err)
-	_, err = byteLimited.firstPage("alice", doc, scanResultsMaxBytes, now)
-	require.NoError(t, err)
+	for i := 0; i < 2; i++ {
+		data, err := byteLimited.firstPage("alice", doc, baseSize, now)
+		require.NoError(t, err)
+		require.NotEmpty(t, decodeResultPage(t, data).ScanID)
+	}
 	require.Len(t, byteLimited.entries, 1)
 	require.Equal(t, scanResultsMaxBytes, byteLimited.bytes)
+
+	var overBudget scanResultStore
+	data, err = overBudget.firstPage("alice", doc, baseSize+1, now)
+	require.NoError(t, err)
+	require.Empty(t, decodeResultPage(t, data).ScanID)
+	require.Empty(t, overBudget.entries)
+
 }
 
 func TestScanResultConcurrentClients(t *testing.T) {
 	ks := &KubescapeMcpserver{}
-	_, data := resultTestDocument(t)
+	doc, _ := resultTestDocument(t)
+	data, err := marshalScanPage(doc, 0, maxFailedResources)
+	require.NoError(t, err)
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
@@ -128,8 +149,10 @@ func TestScanResultConcurrentClients(t *testing.T) {
 			defer wg.Done()
 			ctx := resultTestContext(fmt.Sprintf("client-%d", i))
 			v, err := ks.doResultScan(ctx, "same-scan", func(ctx context.Context) (interface{}, error) {
-				require.Equal(t, true, ctx.Value(fullScanResultsKey{}))
-				return data, nil
+				prepared := ctx.Value(preparedScanResultsKey{}).(*preparedScanResults)
+				return data, prepared.buildSnapshot(doc.scanResponse, len(doc.Resources), func(i int) any {
+					return doc.Resources[i]
+				})
 			})
 			require.NoError(t, err)
 			page := decodeResultPage(t, v.([]byte))
@@ -143,6 +166,92 @@ func TestScanResultConcurrentClients(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestScanResultConcurrentClientLimits(t *testing.T) {
+	const totalFailed = 80
+	manifests := make([]string, totalFailed)
+	for i := range manifests {
+		name := fmt.Sprintf("privileged-pod-%03d", i)
+		manifests[i] = strings.Replace(samplePrivilegedPodManifest, "name: privileged-pod", "name: "+name, 1)
+	}
+	manifest := strings.Join(manifests, "---\n")
+	policyGetter := getSharedLiveClusterPolicyGetter(t)
+
+	for _, firstLimit := range []int{100, 50} {
+		t.Run(fmt.Sprintf("first-limit-%d", firstLimit), func(t *testing.T) {
+			ks := &KubescapeMcpserver{policyGetter: policyGetter}
+			const key = "shared-client-limits"
+			started := make(chan struct{})
+			var scans atomic.Int32
+			run := func(ctx context.Context, limit int) (interface{}, error) {
+				if scans.Add(1) == 1 {
+					close(started)
+				}
+				deadline := time.Now().Add(5 * time.Second)
+				for time.Now().Before(deadline) {
+					ks.scanCtxMu.Lock()
+					state := ks.scanCtxs[key]
+					joined := state != nil && state.count == 2
+					ks.scanCtxMu.Unlock()
+					if joined {
+						return ks.runManifestScan(ctx, manifest, "", []string{"C-0017"}, scanFilterArgs{limit: limit})
+					}
+					time.Sleep(time.Millisecond)
+				}
+				return nil, fmt.Errorf("both callers did not join the shared scan")
+			}
+
+			type scanReply struct {
+				value interface{}
+				err   error
+			}
+			first := make(chan scanReply, 1)
+			firstCtx := resultTestContext("first")
+			secondCtx := resultTestContext("second")
+			go func() {
+				value, err := ks.doResultScan(firstCtx, key, func(ctx context.Context) (interface{}, error) {
+					return run(ctx, firstLimit)
+				}, firstLimit)
+				first <- scanReply{value, err}
+			}()
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first scan did not start")
+			}
+			secondLimit := 150 - firstLimit
+			secondValue, err := ks.doResultScan(secondCtx, key, func(ctx context.Context) (interface{}, error) {
+				return run(ctx, secondLimit)
+			}, secondLimit)
+			require.NoError(t, err)
+			firstReply := <-first
+			require.NoError(t, firstReply.err)
+			require.EqualValues(t, 1, scans.Load())
+
+			full := decodeResultPage(t, firstReply.value.([]byte))
+			limited := decodeResultPage(t, secondValue.([]byte))
+			limitedCtx := secondCtx
+			if firstLimit == 50 {
+				full, limited = limited, full
+				limitedCtx = firstCtx
+			}
+			require.Len(t, full.Resources, totalFailed)
+			require.Equal(t, totalFailed, full.TotalFailed)
+			require.Equal(t, totalFailed, full.ReturnedFailed)
+			require.False(t, full.Truncated)
+			require.Empty(t, full.ScanID)
+			require.Equal(t, full.Resources[:50], limited.Resources)
+			require.Equal(t, totalFailed, limited.TotalFailed)
+			require.Equal(t, 50, limited.ReturnedFailed)
+			require.True(t, limited.Truncated)
+			require.NotNil(t, limited.NextOffset)
+			require.Equal(t, 50, *limited.NextOffset)
+			next, err := ks.scanResults.page(scanResultOwner(limitedCtx), limited.ScanID, 50, 100, time.Now())
+			require.NoError(t, err)
+			require.Equal(t, full.Resources[50:], decodeResultPage(t, next).Resources)
+		})
+	}
 }
 
 func TestScanResultToolValidation(t *testing.T) {
@@ -402,6 +511,43 @@ func TestScanResultSharedDecodingAcrossSnapshots(t *testing.T) {
 			require.Same(t, firstResourcePtr, ptr, "snapshots must share the same decoded slice memory")
 		}
 	}
+}
+
+func BenchmarkScanResultParallelPageReads(b *testing.B) {
+	const owner = "alice"
+	const resourceCount = 2 * maxFailedResources
+	now := time.Now()
+	payload := json.RawMessage(`{"detail":"` + strings.Repeat("x", 4096) + `"}`)
+	doc := scanResultDocument{
+		scanResponse: scanResponse{TotalFailed: resourceCount},
+		Resources:    make([]json.RawMessage, resourceCount),
+	}
+	for i := range doc.Resources {
+		doc.Resources[i] = payload
+	}
+	encoded, err := json.Marshal(doc)
+	require.NoError(b, err)
+	var store scanResultStore
+	first, err := store.firstPage(owner, doc, len(encoded), now)
+	require.NoError(b, err)
+	var firstPage scanResultDocument
+	require.NoError(b, json.Unmarshal(first, &firstPage))
+	require.NotEmpty(b, firstPage.ScanID)
+	require.NotNil(b, firstPage.NextOffset)
+	offset := *firstPage.NextOffset
+	page, err := store.page(owner, firstPage.ScanID, offset, maxFailedResources, now)
+	require.NoError(b, err)
+	b.SetBytes(int64(len(page)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := store.page(owner, firstPage.ScanID, offset, maxFailedResources, now); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
 }
 
 func BenchmarkScanResultOversizedDecoding(b *testing.B) {

@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	gitv5 "github.com/go-git/go-git/v5"
@@ -18,6 +20,8 @@ import (
 	"github.com/kubescape/opa-utils/reporthandling"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	helmchart "helm.sh/helm/v3/pkg/chart"
+	helmchartutil "helm.sh/helm/v3/pkg/chartutil"
 )
 
 func drainFileResourceStream(batchChan <-chan *cautils.ResourceBatch, errChan <-chan error, setupErr error) ([]*cautils.ResourceBatch, []error) {
@@ -977,6 +981,95 @@ func TestGetResourcesFromPathRejectsDirectoryWithoutKubernetesResources(t *testi
 	assert.Contains(t, err.Error(), "no scannable Kubernetes resources")
 }
 
+func TestGetResourcesFromPathWithInvalidManifest(t *testing.T) {
+	cases := []struct {
+		name     string
+		prepare  func(t *testing.T, dir string) string
+		manifest string
+		content  string
+		kind     string
+		source   string
+	}{
+		{
+			name: "Helm chart with invalid YAML helper",
+			prepare: func(t *testing.T, dir string) string {
+				return createTestHelmChartHelper(t, dir, "example")
+			},
+			manifest: "helper.yaml",
+			content:  "pattern: \"v?\\d+\"\n",
+			kind:     "Deployment",
+			source:   reporthandling.SourceTypeHelmChart,
+		},
+		{
+			name: "parent directory with Helm chart and invalid JSON helper",
+			prepare: func(t *testing.T, dir string) string {
+				createTestHelmChartHelper(t, dir, "example")
+				return dir
+			},
+			manifest: "helper.json",
+			content:  "{\"title\": \"{{ include \"example\" . }}\"}\n",
+			kind:     "Deployment",
+			source:   reporthandling.SourceTypeHelmChart,
+		},
+		{
+			name: "Terraform directory",
+			prepare: func(t *testing.T, dir string) string {
+				writeTerraformFixture(t, dir, terraformPodFixture)
+				return dir
+			},
+			kind:   "Pod",
+			source: "Terraform",
+		},
+		{
+			name: "directory with generated Kustomize resource",
+			prepare: func(t *testing.T, dir string) string {
+				app := filepath.Join(dir, "app")
+				require.NoError(t, os.Mkdir(app, 0o750))
+				require.NoError(t, os.WriteFile(filepath.Join(app, "kustomization.yaml"), []byte("configMapGenerator:\n  - name: generated\n    literals:\n      - key=value\n"), 0o600))
+				return dir
+			},
+			kind:   "ConfigMap",
+			source: reporthandling.SourceTypeKustomizeDirectory,
+		},
+		{
+			name: "empty Helm chart",
+			prepare: func(t *testing.T, dir string) string {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "Chart.yaml"), []byte("apiVersion: v2\nname: empty\nversion: 0.1.0\n"), 0o600))
+				return dir
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := tc.prepare(t, t.TempDir())
+			name, content := tc.manifest, tc.content
+			if name == "" {
+				name, content = "bad.yaml", "pattern: \"v?\\d+\"\n"
+			}
+			invalid := filepath.Join(dir, name)
+			require.NoError(t, os.WriteFile(invalid, []byte(content), 0o600))
+
+			sources, workloads, skips, err := getResourcesFromPath(context.Background(), dir, cautils.HelmValueOptions{}, nil)
+			if tc.kind == "" {
+				require.ErrorIs(t, err, cautils.ErrManifestsNotLoaded)
+				assert.Empty(t, workloads)
+			} else {
+				require.NoError(t, err)
+				require.Len(t, workloads, 1)
+				assert.Equal(t, tc.kind, workloads[0].GetKind())
+				assert.Equal(t, tc.source, sources[workloads[0].GetID()].FileType)
+			}
+			require.Len(t, skips, 1)
+			assert.Equal(t, invalid, skips[0].Path)
+			assert.Contains(t, skips[0].Reason, "parse error")
+
+			_, _, _, err = getResourcesFromPath(context.Background(), invalid, cautils.HelmValueOptions{}, nil)
+			require.ErrorIs(t, err, cautils.ErrManifestsNotLoaded)
+		})
+	}
+}
+
 const terraformPodFixture = `
 resource "kubernetes_pod_v1" "example" {
   metadata {
@@ -1636,6 +1729,147 @@ func TestGetWorkloadFromHelmChart_WorkspaceContainment(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotEmpty(t, sources)
 		assert.Len(t, workloads, 1)
+	})
+}
+
+func TestGetResources_ChartAndFileRoute_RelativePaths(t *testing.T) {
+	ctx := context.Background()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	chart := createTestHelmChartHelper(t, dir, "chart")
+	templateDir := filepath.Join(chart, "templates")
+	t.Chdir(dir)
+
+	assertScan := func(t *testing.T, filePath, workspaceDir, wantRoot, wantRelativePath string) {
+		t.Helper()
+		filePath = filepath.FromSlash(filePath)
+		scanInfo := &cautils.ScanInfo{
+			InputPatterns: []string{filePath},
+			ChartPath:     filepath.FromSlash("./chart"),
+			FilePath:      filePath,
+			WorkspaceDir:  workspaceDir,
+			ScanObject:    scanObject("apps/v1", "Deployment", "", "demo-deploy"),
+		}
+		session := cautils.NewOPASessionObj(ctx, nil, nil, scanInfo, nil)
+
+		_, workloads, _, _, err := NewFileResourceHandler().GetResources(ctx, session, scanInfo)
+		require.NoError(t, err)
+		require.Len(t, workloads, 1)
+		require.NotNil(t, session.SingleResourceScan)
+		assert.Equal(t, "demo-deploy", session.SingleResourceScan.GetName())
+		for id := range workloads {
+			source, ok := session.ResourceSource[id]
+			require.True(t, ok, "missing source for %s", id)
+			assert.Equal(t, wantRoot, source.Path)
+			assert.Equal(t, wantRelativePath, source.RelativePath)
+			assert.Equal(t, chart, source.HelmPath)
+		}
+	}
+
+	t.Run("direct template path", func(t *testing.T) {
+		assertScan(t, "./chart/templates/deployment.yaml", "", templateDir, "deployment.yaml")
+	})
+	t.Run("template reached through symlink", func(t *testing.T) {
+		if err := os.Symlink(chart, filepath.Join(dir, "alias")); err != nil {
+			t.Skipf("symlinks are unavailable: %v", err)
+		}
+		assertScan(t, "./alias/templates/deployment.yaml", dir, templateDir, "deployment.yaml")
+	})
+	t.Run("template in Git repository", func(t *testing.T) {
+		_, err := gitv5.PlainInit(dir, false)
+		require.NoError(t, err)
+		assertScan(t, "./chart/templates/deployment.yaml", "", dir, filepath.FromSlash("chart/templates/deployment.yaml"))
+	})
+}
+
+func TestGetResources_ChartAndFileRoute_SymlinkParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows resolves parent path components lexically")
+	}
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	chart := createTestHelmChartHelper(t, dir, "chart")
+	templates := filepath.Join(chart, "templates")
+	targetDir := filepath.Join(templates, "other")
+	linkTarget := filepath.Join(targetDir, "empty")
+	require.NoError(t, os.MkdirAll(linkTarget, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(targetDir, "deployment.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: linked-deploy\n"), 0o600))
+	if err := os.Symlink(linkTarget, filepath.Join(templates, "link")); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+	t.Chdir(dir)
+	filePath := filepath.FromSlash("./chart/templates/link/../deployment.yaml")
+	scanInfo := &cautils.ScanInfo{
+		InputPatterns: []string{filePath},
+		ChartPath:     filepath.FromSlash("./chart"),
+		FilePath:      filePath,
+		WorkspaceDir:  dir,
+		ScanObject:    scanObject("apps/v1", "Deployment", "", "linked-deploy"),
+	}
+	ctx := context.Background()
+	session := cautils.NewOPASessionObj(ctx, nil, nil, scanInfo, nil)
+
+	_, workloads, _, _, err := NewFileResourceHandler().GetResources(ctx, session, scanInfo)
+	require.NoError(t, err)
+	require.Len(t, workloads, 1)
+	for id := range workloads {
+		source := session.ResourceSource[id]
+		assert.Equal(t, targetDir, source.Path)
+		assert.Equal(t, "deployment.yaml", source.RelativePath)
+	}
+}
+
+func TestGetWorkloadFromHelmChart_AmbiguousTemplateAlias(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	chart := createTestHelmChartHelper(t, dir, "chart")
+	templatePath := filepath.Join(chart, "templates", "deployment.yaml")
+	aliasPath := filepath.Join(dir, "alias.yaml")
+	if err := os.Symlink(templatePath, aliasPath); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+	require.NoError(t, os.Symlink(templatePath, filepath.Join(chart, "templates", "second.yaml")))
+
+	_, _, err := getWorkloadFromHelmChart(ctx, aliasPath, chart, aliasPath, cautils.HelmValueOptions{}, 0)
+	require.ErrorContains(t, err, "matches multiple templates")
+	_, workloads, err := getWorkloadFromHelmChart(ctx, templatePath, chart, templatePath, cautils.HelmValueOptions{}, 0)
+	require.NoError(t, err)
+	require.Len(t, workloads, 1)
+}
+
+func TestGetWorkloadFromHelmChart_PackagedDependency(t *testing.T) {
+	chart := createTestHelmChartHelper(t, t.TempDir(), "chart")
+	dependency := &helmchart.Chart{
+		Metadata:  &helmchart.Metadata{APIVersion: "v2", Name: "child", Version: "0.1.0"},
+		Templates: []*helmchart.File{{Name: "templates/pod.yaml", Data: []byte(singlePodManifest)}},
+	}
+	chartsDir := filepath.Join(chart, "charts")
+	_, err := helmchartutil.Save(dependency, chartsDir)
+	require.NoError(t, err)
+	templatePath := filepath.Join(chartsDir, "child", "templates", "pod.yaml")
+
+	assertTemplateMatch := func(t *testing.T) {
+		t.Helper()
+		_, workloads, err := getWorkloadFromHelmChart(context.Background(), templatePath, chart, templatePath, cautils.HelmValueOptions{}, 0)
+		require.NoError(t, err)
+		require.Len(t, workloads, 1)
+		assert.Equal(t, "test-pod", workloads[0].GetName())
+	}
+
+	t.Run("missing dependency directory", func(t *testing.T) {
+		_, err := os.Stat(templatePath)
+		require.ErrorIs(t, err, os.ErrNotExist)
+		assertTemplateMatch(t)
+	})
+	t.Run("ignored file at dependency directory", func(t *testing.T) {
+		require.NoError(t, os.WriteFile(filepath.Join(chart, ".helmignore"), []byte("charts/child\n"), 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(chartsDir, "child"), []byte("ignored\n"), 0o600))
+		_, err := os.Stat(templatePath)
+		require.Error(t, err)
+		if runtime.GOOS != "windows" {
+			require.ErrorIs(t, err, syscall.ENOTDIR)
+		}
+		assertTemplateMatch(t)
 	})
 }
 
