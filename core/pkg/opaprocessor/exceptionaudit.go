@@ -1,6 +1,7 @@
 package opaprocessor
 
 import (
+	"maps"
 	"reflect"
 	"slices"
 	"sort"
@@ -22,6 +23,55 @@ const (
 	exceptionAuditStatusUnused         = "unused"
 )
 
+// exceptionAuditSourceAttribute records a loaded exception's index while
+// updateResults applies exceptions, so every copy the exceptions processor
+// attaches to a rule result can be traced to its source. Content cannot do
+// this: copies are narrowed to the matching posture policies, scope-less ones
+// get a resource designator, and getResourceExceptions repeats a copy once per
+// matching designator.
+const exceptionAuditSourceAttribute = "kubescape.io/exception-audit-source"
+
+// tagExceptionAuditSources returns a copy of exceptionPolicies with each
+// policy's index recorded under exceptionAuditSourceAttribute. Attribute maps
+// are cloned, so caller-owned policies are left intact.
+func tagExceptionAuditSources(exceptionPolicies []armotypes.PostureExceptionPolicy) []armotypes.PostureExceptionPolicy {
+	tagged := slices.Clone(exceptionPolicies)
+	for i := range tagged {
+		attributes := maps.Clone(tagged[i].Attributes)
+		if attributes == nil {
+			attributes = make(map[string]any, 1)
+		}
+		attributes[exceptionAuditSourceAttribute] = i
+		tagged[i].Attributes = attributes
+	}
+	return tagged
+}
+
+// untagExceptionAuditSource gives a tagged policy back the attributes of its
+// source in originals.
+func untagExceptionAuditSource(exception *armotypes.PostureExceptionPolicy, originals []armotypes.PostureExceptionPolicy) {
+	if i, ok := exceptionAuditSource(*exception); ok && i < len(originals) {
+		exception.Attributes = originals[i].Attributes
+	}
+}
+
+func exceptionAuditSource(exception armotypes.PostureExceptionPolicy) (int, bool) {
+	i, ok := exception.Attributes[exceptionAuditSourceAttribute].(int)
+	return i, ok && i >= 0
+}
+
+// exceptionAuditIdentity identifies the loaded exception a match came from: its
+// GUID, else its source index, else (untagged) its name.
+func exceptionAuditIdentity(exception armotypes.PostureExceptionPolicy) string {
+	if exception.GUID != "" {
+		return exception.GUID
+	}
+	if i, ok := exceptionAuditSource(exception); ok {
+		return "\x00source/" + strconv.Itoa(i)
+	}
+	return exceptionAuditName(exception)
+}
+
 func buildExceptionAudit(
 	loadedExceptions []armotypes.PostureExceptionPolicy,
 	activeExceptions []armotypes.PostureExceptionPolicy,
@@ -34,71 +84,51 @@ func buildExceptionAudit(
 ) *cautils.ExceptionAudit {
 	items := make(map[string]*cautils.ExceptionAuditItem, len(loadedExceptions))
 	active := make(map[string]struct{}, len(activeExceptions))
-	// sources holds one slot per loaded exception, grouped by exceptionAuditKey.
-	// Exceptions without a GUID (local files, SecurityException CRDs) are keyed by
-	// name, which is not unique, so each distinct one gets its own item; identical
-	// repeats share their item but keep their own slot.
-	sources := make(map[string][]*exceptionAuditSource, len(loadedExceptions))
+	// sourceItems maps each loaded exception, by index, to its audit item. Exceptions
+	// with a GUID share an item per GUID. Exceptions without one (local files,
+	// SecurityException CRDs) are keyed by name, which is not unique, so each distinct
+	// one gets its own item; identical repeats share one.
+	sourceItems := make([]string, len(loadedExceptions))
 	distinct := make(map[string]int, len(loadedExceptions))
-
-	add := func(exception armotypes.PostureExceptionPolicy) string {
+	for i, exception := range loadedExceptions {
 		key := exceptionAuditKey(exception)
-		id := key
-		if n := distinct[key]; n > 0 {
-			// "\x00" sorts first, keeping same-named items together.
-			id = key + "\x00" + strconv.Itoa(n)
-		}
-		distinct[key]++
-		sources[key] = append(sources[key], &exceptionAuditSource{id: id, exception: exception})
-		item := exceptionAuditItem(exception, policies, processor)
-		items[id] = &item
-		return id
-	}
-	// resolve returns the item of the loaded exception that exception was derived from.
-	// Exact copies are preferred over narrowed ones. The processor attaches at most one
-	// copy per loaded exception to a rule, in load order, so slots already in used are
-	// skipped; this keeps narrowed copies of similar same-named exceptions apart.
-	var resolve func(exception armotypes.PostureExceptionPolicy, used map[*exceptionAuditSource]struct{}) string
-	resolve = func(exception armotypes.PostureExceptionPolicy, used map[*exceptionAuditSource]struct{}) string {
-		key := exceptionAuditKey(exception)
-		candidates := sources[key]
-		if distinct[key] == 1 {
-			return candidates[0].id
-		}
-		for _, matches := range []func(match, loaded armotypes.PostureExceptionPolicy) bool{exceptionEqual, exceptionDerivedFrom} {
-			for _, candidate := range candidates {
-				if _, ok := used[candidate]; ok || !matches(exception, candidate.exception) {
-					continue
-				}
-				if used != nil {
-					used[candidate] = struct{}{}
-				}
-				return candidate.id
+		id := ""
+		for j := range i {
+			if exceptionAuditKey(loadedExceptions[j]) == key && (exception.GUID != "" || identicalExceptions(loadedExceptions[j], exception)) {
+				id = sourceItems[j]
+				break
 			}
 		}
-		if used != nil {
-			return resolve(exception, nil)
+		if id == "" {
+			id = key
+			if n := distinct[key]; n > 0 {
+				// "\x00" sorts first, keeping same-named items together.
+				id = key + "\x00" + strconv.Itoa(n)
+			}
+			distinct[key]++
+			item := exceptionAuditItem(exception, policies, processor)
+			items[id] = &item
 		}
-		return add(exception)
+		sourceItems[i] = id
 	}
 
-loaded:
-	for _, exception := range loadedExceptions {
+	// resolve returns the item of the loaded exception that exception came from.
+	// Exceptions without a source index (callers that did not tag them) fall back to
+	// the GUID-or-name key.
+	resolve := func(exception armotypes.PostureExceptionPolicy) string {
+		if i, ok := exceptionAuditSource(exception); ok && i < len(sourceItems) {
+			return sourceItems[i]
+		}
 		key := exceptionAuditKey(exception)
-		if exception.GUID != "" && len(sources[key]) > 0 {
-			continue
+		if _, ok := items[key]; !ok {
+			item := exceptionAuditItem(exception, policies, processor)
+			items[key] = &item
 		}
-		for _, source := range sources[key] {
-			if exceptionEqual(exception, source.exception) {
-				sources[key] = append(sources[key], &exceptionAuditSource{id: source.id, exception: exception})
-				continue loaded
-			}
-		}
-		add(exception)
+		return key
 	}
 
 	for _, exception := range activeExceptions {
-		active[resolve(exception, nil)] = struct{}{}
+		active[resolve(exception)] = struct{}{}
 	}
 
 	for resourceID, result := range results {
@@ -109,14 +139,13 @@ loaded:
 		for _, control := range result.AssociatedControls {
 			controlID := control.GetID()
 			for _, rule := range control.ResourceAssociatedRules {
-				used := map[*exceptionAuditSource]struct{}{}
 				for _, exception := range rule.Exception {
-					key := resolve(exception, used)
 					// Match with framework context, but retain the original policy's
 					// identity and tuples in the audit entry.
 					if len(exceptions.FilterExceptionsByFrameworks([]armotypes.PostureExceptionPolicy{exception}, cautils.ControlFilters(summary, controlID).FrameworkNames, controlID, rule.GetName())) == 0 {
 						continue
 					}
+					key := resolve(exception)
 					items[key].MatchCount++
 					items[key].MatchedResources = append(items[key].MatchedResources, exceptionAuditMatch(resourceID, controlID, rule.GetName(), resource))
 				}
@@ -127,12 +156,8 @@ loaded:
 	// Manual controls never appear in results (they have no resourcesresults.Result
 	// entries at all), so without this an exception that only suppresses a manual
 	// control is reported as unused even though it is actively applied.
-	usedByControl := map[string]map[*exceptionAuditSource]struct{}{}
 	for _, match := range manualControlMatches {
-		if usedByControl[match.controlID] == nil {
-			usedByControl[match.controlID] = map[*exceptionAuditSource]struct{}{}
-		}
-		key := resolve(match.exception, usedByControl[match.controlID])
+		key := resolve(match.exception)
 		items[key].MatchCount++
 		items[key].MatchedResources = append(items[key].MatchedResources, cautils.ExceptionAuditMatch{ControlID: match.controlID})
 	}
@@ -201,31 +226,23 @@ func exceptionAuditKey(exception armotypes.PostureExceptionPolicy) string {
 	return exceptionAuditName(exception)
 }
 
-type exceptionAuditSource struct {
-	id        string
-	exception armotypes.PostureExceptionPolicy
-}
-
-func exceptionEqual(a, b armotypes.PostureExceptionPolicy) bool {
+// identicalExceptions reports whether a and b are the same policy, ignoring the
+// source index recorded by tagExceptionAuditSources.
+func identicalExceptions(a, b armotypes.PostureExceptionPolicy) bool {
+	a.Attributes, b.Attributes = withoutExceptionAuditSource(a.Attributes), withoutExceptionAuditSource(b.Attributes)
 	return reflect.DeepEqual(a, b)
 }
 
-// exceptionDerivedFrom reports whether match, an exception copy attached to a rule
-// result, came from loaded. The exceptions processor narrows PosturePolicies to the
-// ones matching the rule, and resourceScopedExceptions gives scope-less exceptions a
-// resource designator; every other field is copied unchanged.
-func exceptionDerivedFrom(match, loaded armotypes.PostureExceptionPolicy) bool {
-	if len(loaded.Resources) > 0 && !reflect.DeepEqual(match.Resources, loaded.Resources) {
-		return false
+func withoutExceptionAuditSource(attributes map[string]any) map[string]any {
+	if _, ok := attributes[exceptionAuditSourceAttribute]; !ok {
+		return attributes
 	}
-	for _, policy := range match.PosturePolicies {
-		if !slices.ContainsFunc(loaded.PosturePolicies, func(p armotypes.PosturePolicy) bool { return reflect.DeepEqual(p, policy) }) {
-			return false
-		}
+	attributes = maps.Clone(attributes)
+	delete(attributes, exceptionAuditSourceAttribute)
+	if len(attributes) == 0 {
+		return nil
 	}
-	match.Resources, loaded.Resources = nil, nil
-	match.PosturePolicies, loaded.PosturePolicies = nil, nil
-	return reflect.DeepEqual(match, loaded)
+	return attributes
 }
 
 func exceptionAuditName(exception armotypes.PostureExceptionPolicy) string {

@@ -2,11 +2,14 @@ package opaprocessor
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/armosec/armoapi-go/armotypes"
+	"github.com/armosec/armoapi-go/identifiers"
 	"github.com/kubescape/k8s-interface/workloadinterface"
 	"github.com/kubescape/kubescape/v4/core/cautils"
 	"github.com/kubescape/opa-utils/exceptions"
@@ -220,159 +223,205 @@ func TestBuildExceptionAuditDoesNotCollapseDuplicateNamesWithDifferentGUIDs(t *t
 }
 
 // Exceptions from --exceptions files and SecurityException CRDs have no GUID, and
-// CRD-derived names ("<name>/<controlID>") are only unique per namespace, so
-// same-named exceptions must still get one audit item each.
-func TestBuildExceptionAuditDoesNotCollapseDuplicateNamesWithoutGUID(t *testing.T) {
+// CRD-derived names ("<name>/<controlID>") are only unique per namespace. Every
+// loaded exception must keep its own matches whatever copies the exceptions
+// processor attaches to a rule: copies narrowed to the matching posture policies,
+// resource-scoped copies of scope-less exceptions, and one copy per matching
+// designator when resource selectors overlap.
+func TestUpdateResults_ExceptionAuditAttributesMatchesToTheirSource(t *testing.T) {
 	expiredAt := time.Now().Add(-time.Hour)
-	resource := workloadinterface.NewWorkloadObj(map[string]any{
-		"apiVersion": "apps/v1",
-		"kind":       "Deployment",
-		"metadata":   map[string]any{"name": "web", "namespace": "prod"},
-	})
-	policies := &cautils.Policies{Controls: map[string]reporthandling.Control{
-		"C-0057": {ControlID: "C-0057"},
-		"C-0017": {ControlID: "C-0017"},
-	}}
+	nginx := []identifiers.PortalDesignator{auditDesignator("kind", "Deployment", "namespace", "default", "name", "nginx")}
+	oldApp := []identifiers.PortalDesignator{auditDesignator("kind", "Deployment", "namespace", "default", "name", "old-app")}
+	// Both designators match default/nginx, so each exception is attached twice.
+	overlapping := []identifiers.PortalDesignator{auditDesignator("kind", "Deployment"), auditDesignator("namespace", "default")}
 
 	for _, tc := range []struct {
-		name         string
-		staleExpires *time.Time
-		wantStale    string
-		wantExpired  int
-		wantUnused   int
-		wantActive   int
+		name       string
+		exceptions []armotypes.PostureExceptionPolicy
+		// want maps each item's control IDs to "status/matchCount". matchCount
+		// counts every copy attached to a rule, as for a single exception.
+		want map[string]string
 	}{
-		{name: "unused", wantStale: exceptionAuditStatusUnused, wantUnused: 1, wantActive: 2},
-		{name: "expired", staleExpires: &expiredAt, wantStale: exceptionAuditStatusExpired, wantExpired: 1, wantActive: 1},
+		{
+			name: "overlapping resource selectors",
+			exceptions: []armotypes.PostureExceptionPolicy{
+				auditSourceException(overlapping, nil, "C-0001", "C-0002"),
+				auditSourceException(overlapping, nil, "C-0001", "C-0003"),
+			},
+			want: map[string]string{"C-0001,C-0002": "matched/2", "C-0001,C-0003": "matched/2"},
+		},
+		{
+			name: "copies narrowed to a shared control",
+			exceptions: []armotypes.PostureExceptionPolicy{
+				auditSourceException(nginx, nil, "C-0001", "C-0002"),
+				auditSourceException(nginx, nil, "C-0001", "C-0003"),
+			},
+			want: map[string]string{"C-0001,C-0002": "matched/1", "C-0001,C-0003": "matched/1"},
+		},
+		{
+			// The first exception's narrowed copy has exactly the content of the
+			// second one; only its source index tells them apart.
+			name: "narrowed copy identical to another exception",
+			exceptions: []armotypes.PostureExceptionPolicy{
+				auditSourceException(nginx, nil, "C-0001", "C-0002"),
+				auditSourceException(nginx, nil, "C-0001"),
+			},
+			want: map[string]string{"C-0001,C-0002": "matched/1", "C-0001": "matched/1"},
+		},
+		{
+			name: "scope-less exceptions",
+			exceptions: []armotypes.PostureExceptionPolicy{
+				auditSourceException(nil, nil, "C-0001", "C-0002"),
+				auditSourceException(nil, nil, "C-0001", "C-0003"),
+			},
+			want: map[string]string{"C-0001,C-0002": "matched/1", "C-0001,C-0003": "matched/1"},
+		},
+		{
+			name: "unused exception",
+			exceptions: []armotypes.PostureExceptionPolicy{
+				auditSourceException(nginx, nil, "C-0001"),
+				auditSourceException(oldApp, nil, "C-0017"),
+			},
+			want: map[string]string{"C-0001": "matched/1", "C-0017": "unused/0"},
+		},
+		{
+			name: "expired exception",
+			exceptions: []armotypes.PostureExceptionPolicy{
+				auditSourceException(nginx, nil, "C-0001"),
+				auditSourceException(oldApp, &expiredAt, "C-0017"),
+			},
+			want: map[string]string{"C-0001": "matched/1", "C-0017": "expired/0"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// Same name, different namespaces, as two SecurityException CRDs produce.
-			applied := auditException("allow-privileged/C-0057", "C-0057", nil)
-			applied.PosturePolicies = append(applied.PosturePolicies, armotypes.PosturePolicy{ControlID: "C-0057", FrameworkName: "nsa"})
-			applied.Attributes = map[string]any{"securityExceptionNamespace": "team-a"}
-			stale := auditException("allow-privileged/C-0057", "C-0017", tc.staleExpires)
-			stale.Attributes = map[string]any{"securityExceptionNamespace": "team-b"}
-
-			// The copy attached to the rule result has its posture policies narrowed
-			// and, being scope-less, a resource designator added.
-			matched := applied
-			matched.PosturePolicies = applied.PosturePolicies[:1]
-			matched.Resources = resourceScopedExceptions([]armotypes.PostureExceptionPolicy{applied}, resource.GetID())[0].Resources
-
-			active := []armotypes.PostureExceptionPolicy{applied, stale}
-			if tc.staleExpires != nil {
-				active = active[:1]
+			distinct := make([]armotypes.PostureExceptionPolicy, len(tc.exceptions))
+			for i, exception := range tc.exceptions {
+				distinct[i] = exception
+				distinct[i].Name = fmt.Sprintf("exception-%d", i)
 			}
-			audit := buildExceptionAudit(
-				[]armotypes.PostureExceptionPolicy{applied, stale},
-				active,
-				map[string]resourcesresults.Result{
-					resource.GetID(): {
-						ResourceID: resource.GetID(),
-						AssociatedControls: []resourcesresults.ResourceAssociatedControl{{
-							ControlID: "C-0057",
-							ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{{
-								Name:      "rule-privilege-escalation",
-								Exception: []armotypes.PostureExceptionPolicy{matched},
-							}},
-						}},
-					},
-				},
-				cautils.NewMapResourceCatalog(map[string]workloadinterface.IMetadata{resource.GetID(): resource}),
-				policies,
-				exceptions.NewProcessor(),
-				nil,
-				nil,
-			)
 
-			require.Len(t, audit.Items, 2)
-			assert.Equal(t, 2, audit.Summary.Total)
-			assert.Equal(t, tc.wantActive, audit.Summary.Active)
-			assert.Equal(t, 1, audit.Summary.Matched)
-			assert.Equal(t, tc.wantUnused, audit.Summary.Unused)
-			assert.Equal(t, tc.wantExpired, audit.Summary.Expired)
-
-			byControl := map[string]cautils.ExceptionAuditItem{}
-			for _, item := range audit.Items {
-				require.Len(t, item.ControlIDs, 1)
-				byControl[item.ControlIDs[0]] = item
-			}
-			assert.Equal(t, exceptionAuditStatusMatched, byControl["C-0057"].Status)
-			assert.Equal(t, 1, byControl["C-0057"].MatchCount)
-			assert.Equal(t, tc.wantStale, byControl["C-0017"].Status)
-			assert.Equal(t, 0, byControl["C-0017"].MatchCount)
+			sameName := auditItemsByControls(runUpdateResultsAudit(t, tc.exceptions))
+			assert.Equal(t, tc.want, sameName)
+			assert.Equal(t, auditItemsByControls(runUpdateResultsAudit(t, distinct)), sameName,
+				"same-named exceptions must be audited exactly like distinctly named ones")
 		})
 	}
 }
 
-// Same-named exceptions whose rule-result copies are narrowed to the same control by
-// the exceptions processor must each keep their own match, including when one
-// exception's controls are a subset of the other's.
-func TestUpdateResults_ExceptionAuditKeepsNarrowedSameNameMatchesApart(t *testing.T) {
+// Identical repeats of one exception share an item that collects the matches of
+// every occurrence, and never take matches from a different same-named exception.
+func TestUpdateResults_ExceptionAuditGroupsIdenticalRepeats(t *testing.T) {
+	nginx := []identifiers.PortalDesignator{auditDesignator("kind", "Deployment", "namespace", "default", "name", "nginx")}
+	overlapping := []identifiers.PortalDesignator{auditDesignator("kind", "Deployment"), auditDesignator("namespace", "default")}
+
+	for _, tc := range []struct {
+		name      string
+		resources []identifiers.PortalDesignator
+		want      map[string]string
+	}{
+		{name: "single selector", resources: nginx, want: map[string]string{"C-0001,C-0002": "matched/1", "C-0001,C-0003": "matched/2"}},
+		{name: "overlapping resource selectors", resources: overlapping, want: map[string]string{"C-0001,C-0002": "matched/2", "C-0001,C-0003": "matched/4"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repeated := auditSourceException(tc.resources, nil, "C-0001", "C-0003")
+			audit := runUpdateResultsAudit(t, []armotypes.PostureExceptionPolicy{
+				auditSourceException(tc.resources, nil, "C-0001", "C-0002"),
+				repeated,
+				repeated,
+			})
+			assert.Equal(t, tc.want, auditItemsByControls(audit))
+			assert.Equal(t, 2, audit.Summary.Total)
+			assert.Equal(t, 2, audit.Summary.Active)
+		})
+	}
+}
+
+// runUpdateResultsAudit runs updateResults with the audit enabled over a
+// Deployment default/nginx that fails C-0001 through rule-a. It also checks that
+// the source index used by the audit leaves no trace: the input policies are not
+// modified and the results are the same as with the audit disabled.
+func runUpdateResultsAudit(t *testing.T, loaded []armotypes.PostureExceptionPolicy) *cautils.ExceptionAudit {
+	t.Helper()
 	resource := workloadinterface.NewWorkloadObj(map[string]any{
 		"apiVersion": "apps/v1",
 		"kind":       "Deployment",
 		"metadata":   map[string]any{"name": "nginx", "namespace": "default"},
 	})
-
-	for _, tc := range []struct {
-		name          string
-		first, second []string
-		repeatSecond  bool
-	}{
-		{name: "overlapping controls", first: []string{"C-0001", "C-0002"}, second: []string{"C-0001", "C-0003"}},
-		{name: "subset controls", first: []string{"C-0001", "C-0002"}, second: []string{"C-0001"}},
-		{name: "repeated identical exception", first: []string{"C-0001", "C-0002"}, second: []string{"C-0001", "C-0003"}, repeatSecond: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			exception := func(controlIDs []string) armotypes.PostureExceptionPolicy {
-				e := armotypes.PostureExceptionPolicy{PortalBase: armotypes.PortalBase{Name: "shared"}}
-				for _, id := range controlIDs {
-					e.PosturePolicies = append(e.PosturePolicies, armotypes.PosturePolicy{ControlID: id})
-				}
-				return e
-			}
-
-			session := cautils.NewOPASessionObjMock()
-			session.AuditExceptions = true
-			session.AllResources[resource.GetID()] = resource
-			session.ResourcesResult[resource.GetID()] = resourcesresults.Result{
-				ResourceID: resource.GetID(),
-				AssociatedControls: []resourcesresults.ResourceAssociatedControl{{
-					ControlID:               "C-0001",
-					Name:                    "control-1",
-					Status:                  apis.StatusInfo{InnerStatus: apis.StatusFailed},
-					ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{{Name: "rule-a", Status: apis.StatusFailed}},
-				}},
-			}
-			session.Exceptions = []armotypes.PostureExceptionPolicy{exception(tc.first), exception(tc.second)}
-			wantSecond := 1
-			if tc.repeatSecond {
-				session.Exceptions = append(session.Exceptions, exception(tc.second))
-				wantSecond = 2
-			}
-			session.AllPolicies = &cautils.Policies{Controls: map[string]reporthandling.Control{
-				"C-0001": {ControlID: "C-0001"},
-				"C-0002": {ControlID: "C-0002"},
-				"C-0003": {ControlID: "C-0003"},
-			}}
-			session.Report.SummaryDetails.Controls = reportsummary.ControlSummaries{"C-0001": {ControlID: "C-0001"}}
-
-			opap := &OPAProcessor{OPASessionObj: session}
-			opap.updateResults(context.Background())
-
-			audit := opap.ExceptionAudit
-			require.NotNil(t, audit)
-			require.Len(t, audit.Items, 2)
-			assert.Equal(t, 2, audit.Summary.Active)
-			assert.Equal(t, 2, audit.Summary.Matched)
-			byControls := map[string]int{}
-			for _, item := range audit.Items {
-				byControls[strings.Join(item.ControlIDs, ",")] = item.MatchCount
-			}
-			assert.Equal(t, map[string]int{strings.Join(tc.first, ","): 1, strings.Join(tc.second, ","): wantSecond}, byControls)
-		})
+	run := func(audit bool) *OPAProcessor {
+		session := cautils.NewOPASessionObjMock()
+		session.AuditExceptions = audit
+		session.AllResources[resource.GetID()] = resource
+		session.ResourcesResult[resource.GetID()] = resourcesresults.Result{
+			ResourceID: resource.GetID(),
+			AssociatedControls: []resourcesresults.ResourceAssociatedControl{{
+				ControlID:               "C-0001",
+				Name:                    "control-1",
+				Status:                  apis.StatusInfo{InnerStatus: apis.StatusFailed},
+				ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{{Name: "rule-a", Status: apis.StatusFailed}},
+			}},
+		}
+		session.Exceptions = loaded
+		session.AllPolicies = &cautils.Policies{Controls: map[string]reporthandling.Control{
+			"C-0001": {ControlID: "C-0001"},
+			"C-0002": {ControlID: "C-0002"},
+			"C-0003": {ControlID: "C-0003"},
+			"C-0017": {ControlID: "C-0017"},
+		}}
+		session.Report.SummaryDetails.Controls = reportsummary.ControlSummaries{"C-0001": {ControlID: "C-0001"}}
+		opap := &OPAProcessor{OPASessionObj: session}
+		opap.updateResults(context.Background())
+		return opap
 	}
+
+	before, err := json.Marshal(loaded)
+	require.NoError(t, err)
+	audited, plain := run(true), run(false)
+	after, err := json.Marshal(loaded)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(before), string(after), "input policies must remain intact")
+
+	auditedResults, err := json.Marshal(audited.ResourcesResult)
+	require.NoError(t, err)
+	plainResults, err := json.Marshal(plain.ResourcesResult)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(plainResults), string(auditedResults), "the audit must not change scan results")
+	assert.NotContains(t, string(auditedResults), exceptionAuditSourceAttribute)
+	for _, exception := range audited.Exceptions {
+		assert.NotContains(t, exception.Attributes, exceptionAuditSourceAttribute)
+	}
+
+	require.NotNil(t, audited.ExceptionAudit)
+	return audited.ExceptionAudit
+}
+
+func auditItemsByControls(audit *cautils.ExceptionAudit) map[string]string {
+	items := make(map[string]string, len(audit.Items))
+	for _, item := range audit.Items {
+		items[strings.Join(item.ControlIDs, ",")] = fmt.Sprintf("%s/%d", item.Status, item.MatchCount)
+	}
+	return items
+}
+
+func auditSourceException(resources []identifiers.PortalDesignator, expirationDate *time.Time, controlIDs ...string) armotypes.PostureExceptionPolicy {
+	exception := armotypes.PostureExceptionPolicy{
+		PortalBase:     armotypes.PortalBase{Name: "shared"},
+		PolicyType:     "postureExceptionPolicy",
+		Actions:        []armotypes.PostureExceptionPolicyActions{armotypes.AlertOnly},
+		Resources:      resources,
+		ExpirationDate: expirationDate,
+	}
+	for _, controlID := range controlIDs {
+		exception.PosturePolicies = append(exception.PosturePolicies, armotypes.PosturePolicy{ControlID: controlID})
+	}
+	return exception
+}
+
+func auditDesignator(keyValues ...string) identifiers.PortalDesignator {
+	attributes := make(map[string]string, len(keyValues)/2)
+	for i := 0; i+1 < len(keyValues); i += 2 {
+		attributes[keyValues[i]] = keyValues[i+1]
+	}
+	return identifiers.PortalDesignator{DesignatorType: identifiers.DesignatorAttributes, Attributes: attributes}
 }
 
 // Two distinct same-named exceptions matching one manual control each keep their
@@ -420,17 +469,6 @@ func TestUpdateResults_ExceptionAuditCountsSameGUIDManualMatchOnce(t *testing.T)
 
 	require.Len(t, opap.ExceptionAudit.Items, 1)
 	assert.Equal(t, 1, opap.ExceptionAudit.Items[0].MatchCount)
-}
-
-func TestBuildExceptionAuditMergesIdenticalExceptions(t *testing.T) {
-	exception := auditException("dup", "C-0001", nil)
-	audit := buildExceptionAudit(
-		[]armotypes.PostureExceptionPolicy{exception, exception},
-		[]armotypes.PostureExceptionPolicy{exception, exception},
-		nil, nil, nil, exceptions.NewProcessor(), nil, nil,
-	)
-	require.Len(t, audit.Items, 1)
-	assert.Equal(t, 1, audit.Summary.Active)
 }
 
 func auditException(name, controlID string, expirationDate *time.Time) armotypes.PostureExceptionPolicy {

@@ -3,7 +3,6 @@ package opaprocessor
 import (
 	"context"
 	"regexp"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -54,6 +53,12 @@ func (opap *OPAProcessor) updateResults(ctx context.Context) {
 	// (only when the caller has opted in; disabled by default for cluster scans)
 	if opap.HonorInlineExceptions {
 		opap.Exceptions = append(opap.Exceptions, opap.gatherInlineExceptions()...)
+	}
+	// The audit traces matches back to loaded exceptions through a source index that
+	// is removed again once the audit is built.
+	originalExceptions := opap.Exceptions
+	if opap.AuditExceptions {
+		opap.Exceptions = tagExceptionAuditSources(opap.Exceptions)
 	}
 	loadedExceptions := append([]armotypes.PostureExceptionPolicy(nil), opap.Exceptions...)
 
@@ -111,6 +116,25 @@ func (opap *OPAProcessor) updateResults(ctx context.Context) {
 
 	if opap.AuditExceptions {
 		opap.ExceptionAudit = buildExceptionAudit(loadedExceptions, opap.Exceptions, opap.ResourcesResult, opap.GetCatalog(), opap.AllPolicies, processor, manualControlMatches, &opap.Report.SummaryDetails)
+		opap.untagExceptionAuditSources(originalExceptions)
+	}
+}
+
+// untagExceptionAuditSources restores the original attributes on the active
+// exceptions and on every copy attached to a rule result.
+func (opap *OPAProcessor) untagExceptionAuditSources(originals []armotypes.PostureExceptionPolicy) {
+	for i := range opap.Exceptions {
+		untagExceptionAuditSource(&opap.Exceptions[i], originals)
+	}
+	for _, result := range opap.ResourcesResult {
+		for ci := range result.AssociatedControls {
+			rules := result.AssociatedControls[ci].ResourceAssociatedRules
+			for ri := range rules {
+				for ei := range rules[ri].Exception {
+					untagExceptionAuditSource(&rules[ri].Exception[ei], originals)
+				}
+			}
+		}
 	}
 }
 
@@ -172,21 +196,14 @@ func applyExceptionsToManualControls(
 
 	// A partial framework match is still an audit match, but the same exception
 	// applied through multiple frameworks counts only once for each control.
-	// Exceptions with a GUID are identified by it; GUID-less ones share names, so
-	// compare them whole to keep a distinct same-named exception.
-	seen := make(map[string][]armotypes.PostureExceptionPolicy)
+	seen := make(map[struct{ exception, control string }]bool)
 	unique := matches[:0]
 	for _, match := range matches {
-		if slices.ContainsFunc(seen[match.controlID], func(e armotypes.PostureExceptionPolicy) bool {
-			if e.GUID != "" || match.exception.GUID != "" {
-				return e.GUID == match.exception.GUID
-			}
-			return exceptionEqual(e, match.exception)
-		}) {
-			continue
+		key := struct{ exception, control string }{exceptionAuditIdentity(match.exception), match.controlID}
+		if !seen[key] {
+			seen[key] = true
+			unique = append(unique, match)
 		}
-		seen[match.controlID] = append(seen[match.controlID], match.exception)
-		unique = append(unique, match)
 	}
 	return unique
 }
